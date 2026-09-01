@@ -8,6 +8,7 @@ pub mod constants;
 pub mod crypto;
 pub mod error;
 pub mod formatting;
+pub mod markdown_spans;
 pub mod model;
 pub mod paths;
 pub mod search;
