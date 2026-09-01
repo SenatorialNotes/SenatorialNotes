@@ -33,6 +33,26 @@ All notable changes to SenatorialNotes will be documented here. The format follo
 - Keyboard: `Ctrl+Shift+N` new notebook, `Ctrl+1`/`Ctrl+2` focus the note
   list/editor, `Ctrl+]`/`Ctrl+[` next/previous note, `Ctrl+Shift+P` pin,
   `Ctrl+Shift+A` archive, `Alt+Return` note information.
+- Editor V2: live-preview visual rendering of Markdown while it is still the
+  literal text on disk. Headings render at a real visual hierarchy, bold and
+  italic render as bold and italic (including bold+italic together, and one
+  level of nesting either way), strikethrough/highlight/inline code/quotes/
+  lists/checklists/links/dividers get appropriate visual treatment, and
+  marker punctuation (`**`, `#`, `~~`, `==`, `` ` ``, list/quote prefixes) is
+  visually subdued rather than hidden. Unsupported or malformed Markdown is
+  left completely untouched. A debounced whole-buffer pass recomputes
+  styling after each edit; the Bold/Italic toolbar buttons reflect the
+  format(s) active at the cursor or selection.
+  - *Design note:* the original plan explored hiding markers entirely
+    (Obsidian/Typora-style) using `GtkTextTag:invisible`, gated behind a
+    prototype before committing to it. That prototype found a real, fatal
+    crash in GTK4's own text engine (`gtktextbtree.c`) when moving the
+    cursor programmatically through a buffer containing any invisible-tagged
+    span - reproducible with plain ASCII, not Unicode-related, and with no
+    viable application-level workaround for that specific navigation model.
+    Editor V2 therefore never uses `GtkTextTag:invisible`, custom cursor
+    navigation, or any hidden-text mechanism; markers stay visible but
+    dimmed. See the v0.2 completion report for the full writeup.
 
 #### Changed
 

@@ -13,6 +13,7 @@ use gtk::glib::variant::ToVariant;
 use senatorial_notes::config::{Accent, AppConfig, NoteListDensity, SortOrder, Theme};
 use senatorial_notes::constants::{APP_ID, APP_NAME, MIN_PASSWORD_LENGTH, PRIVACY_STATEMENT};
 use senatorial_notes::formatting::{FormatAction, apply_markdown_format};
+use senatorial_notes::markdown_spans::{self, SpanKind};
 use senatorial_notes::search::summary_matches;
 use senatorial_notes::sort::sort_notes;
 use senatorial_notes::ui_state::{
@@ -196,7 +197,21 @@ struct Widgets {
     tag_add_entry: gtk::Entry,
     buffer: sourceview5::Buffer,
     editor: sourceview5::View,
+    /// The single outstanding debounced Markdown live-preview style
+    /// recompute, if one is armed. A separate timer from the autosave ones
+    /// in `PendingSaves` - restyling and saving are independent concerns
+    /// with independent delays.
+    style_recompute_source: Rc<RefCell<Option<glib::SourceId>>>,
     formatting_bar: gtk::ScrolledWindow,
+    /// Bold/Italic toolbar buttons. The existing theme/accent-aware
+    /// `brand-accent` CSS class is toggled on whichever are active at the
+    /// cursor/selection (see `active_formats_at`) - plain buttons rather
+    /// than `GtkToggleButton`s, since they are also wired to
+    /// `app.format-*` via `set_action_name` and a toggle button's own
+    /// click-driven active state would fight this external,
+    /// cursor-position-driven one.
+    format_bold_button: gtk::Button,
+    format_italic_button: gtk::Button,
     save_status: gtk::Label,
     locked_copy: gtk::Label,
     trash_detail_title: gtk::Label,
@@ -427,6 +442,27 @@ fn build_application(application: &Application) {
     }
 
     {
+        // A separate debounce from the autosave one above - restyling and
+        // saving are independent concerns with independent delays. Skipped
+        // during a programmatic load (editor_events suppressed): that path
+        // restyles synchronously in display_document instead.
+        let widgets = widgets.clone();
+        let buffer = widgets.buffer.clone();
+        buffer.connect_changed(move |_| {
+            if widgets.editor_events.is_suppressed() {
+                return;
+            }
+            schedule_style_recompute(&widgets);
+        });
+    }
+
+    {
+        let widgets = widgets.clone();
+        let buffer = widgets.buffer.clone();
+        buffer.connect_cursor_position_notify(move |_| update_format_toolbar_state(&widgets));
+    }
+
+    {
         let state = state.clone();
         let widgets = widgets.clone();
         let pending = pending.clone();
@@ -556,6 +592,9 @@ fn build_application(application: &Application) {
         widgets.window.clone().connect_close_request(move |_| {
             cancel_all_timers(&pending);
             cancel_pending_selection(&widgets);
+            if let Some(source) = widgets.style_recompute_source.borrow_mut().take() {
+                source.remove();
+            }
             if persist_active(&state, &widgets, true) {
                 clear_sensitive_documents(&state);
                 // Detach the shared context menu before its parent is disposed.
@@ -939,7 +978,7 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     tags_row.append(&tag_add_entry);
     editor_box.append(&tags_row);
 
-    let formatting_bar = build_formatting_bar();
+    let (formatting_bar, format_bold_button, format_italic_button) = build_formatting_bar();
     editor_box.append(&formatting_bar);
     let buffer = sourceview5::Buffer::new(None::<&gtk::TextTagTable>);
     if let Some(language) = sourceview5::LanguageManager::default().language("markdown") {
@@ -947,6 +986,7 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
         buffer.set_highlight_syntax(true);
     }
     buffer.set_highlight_matching_brackets(true);
+    register_markdown_style_tags(&buffer);
     let editor = sourceview5::View::with_buffer(&buffer);
     editor.add_css_class("editor-view");
     editor.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -1102,7 +1142,10 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
             tag_add_entry,
             buffer,
             editor,
+            style_recompute_source: Rc::new(RefCell::new(None)),
             formatting_bar,
+            format_bold_button,
+            format_italic_button,
             save_status,
             locked_copy,
             trash_detail_title,
@@ -1148,7 +1191,7 @@ fn application_menu() -> gio::Menu {
     menu
 }
 
-fn build_formatting_bar() -> gtk::ScrolledWindow {
+fn build_formatting_bar() -> (gtk::ScrolledWindow, gtk::Button, gtk::Button) {
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     bar.set_margin_start(12);
     bar.set_margin_end(12);
@@ -1182,10 +1225,7 @@ fn build_formatting_bar() -> gtk::ScrolledWindow {
         .build();
     bar.append(&styles);
 
-    for (label, tooltip, action) in [
-        ("B", "Bold (Ctrl+B)", "app.format-bold"),
-        ("I", "Italic (Ctrl+I)", "app.format-italic"),
-    ] {
+    fn format_button(bar: &gtk::Box, label: &str, tooltip: &str, action: &str) -> gtk::Button {
         let button = gtk::Button::with_label(label);
         button.add_css_class("flat");
         button.add_css_class("format-button");
@@ -1193,7 +1233,10 @@ fn build_formatting_bar() -> gtk::ScrolledWindow {
         button.set_action_name(Some(action));
         button.update_property(&[gtk::accessible::Property::Label(tooltip)]);
         bar.append(&button);
+        button
     }
+    let bold_button = format_button(&bar, "B", "Bold (Ctrl+B)", "app.format-bold");
+    let italic_button = format_button(&bar, "I", "Italic (Ctrl+I)", "app.format-italic");
 
     let more_menu = gio::Menu::new();
     let inline = gio::Menu::new();
@@ -1224,7 +1267,7 @@ fn build_formatting_bar() -> gtk::ScrolledWindow {
         .tooltip_text("More Markdown formatting")
         .build();
     bar.append(&more);
-    bar_scroll
+    (bar_scroll, bold_button, italic_button)
 }
 
 fn sidebar_button(label: &str, icon: &str) -> gtk::Button {
@@ -1735,6 +1778,11 @@ fn display_document(document: ActiveDocument, state: &Rc<RefCell<AppState>>, wid
     widgets.formatting_bar.set_sensitive(true);
     widgets.title.set_text(&title);
     set_buffer_text_silently(&widgets.buffer, &body);
+    // Style the note as soon as it opens rather than waiting for the user's
+    // first edit; loading is already suppressed above, so the debounced
+    // recompute wired to buffer::changed would otherwise never fire here.
+    recompute_markdown_styles(&widgets.buffer);
+    update_format_toolbar_state(widgets);
     widgets.document_stack.set_visible_child_name("editor");
     widgets.save_status.set_label(if encrypted {
         "Unlocked · encrypted at rest"
@@ -5889,6 +5937,279 @@ fn char_to_byte(value: &str, char_index: usize) -> usize {
 
 fn byte_to_char(value: &str, byte_index: usize) -> usize {
     value[..byte_index.min(value.len())].chars().count()
+}
+
+// --- Editor V2: live-preview Markdown rendering ---------------------------
+//
+// The GtkSourceView buffer holds literal Markdown at all times, exactly as
+// it always has - saving, loading, undo/redo, and encryption are completely
+// unaffected by anything below. This is a purely presentational layer: a
+// debounced pass reads the buffer's text, asks `markdown_spans` what should
+// be styled, and applies a fixed set of `GtkTextTag`s. Marker punctuation is
+// dimmed, never hidden - Stage C.0 found that `GtkTextTag:invisible` crashes
+// GTK4's own text b-tree when combined with programmatic cursor movement
+// (see the plan/completion report), so this design uses no invisible text,
+// no custom cursor handling, and no buffer transformation of any kind.
+
+const MARKDOWN_MARKER_TAG: &str = "md-marker";
+const MARKDOWN_STYLE_TAGS: &[&str] = &[
+    "md-h1",
+    "md-h2",
+    "md-h3",
+    "md-bold",
+    "md-italic",
+    "md-strike",
+    "md-highlight",
+    "md-code",
+    "md-quote",
+    "md-link",
+    "md-checked",
+];
+
+/// Registers the fixed tag set once, at buffer construction. Every property
+/// used here is purely visual (weight, style, scale, colour, strikethrough,
+/// underline, margin) - never `invisible`. Marker punctuation is dimmed by
+/// reducing the alpha of an otherwise mid-grey foreground, which reads as
+/// "muted" against both light and dark themes without hardcoding a colour
+/// that would look wrong in one of them.
+fn register_markdown_style_tags(buffer: &sourceview5::Buffer) {
+    let table = buffer.tag_table();
+
+    let marker = gtk::TextTag::builder().name(MARKDOWN_MARKER_TAG).build();
+    marker.set_foreground_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.6)));
+    table.add(&marker);
+
+    let h1 = gtk::TextTag::builder()
+        .name("md-h1")
+        .weight(700)
+        .scale(1.42)
+        .build();
+    table.add(&h1);
+    let h2 = gtk::TextTag::builder()
+        .name("md-h2")
+        .weight(700)
+        .scale(1.24)
+        .build();
+    table.add(&h2);
+    let h3 = gtk::TextTag::builder()
+        .name("md-h3")
+        .weight(700)
+        .scale(1.1)
+        .build();
+    table.add(&h3);
+    let bold = gtk::TextTag::builder().name("md-bold").weight(700).build();
+    table.add(&bold);
+    let italic = gtk::TextTag::builder()
+        .name("md-italic")
+        .style(gtk::pango::Style::Italic)
+        .build();
+    table.add(&italic);
+    let strike = gtk::TextTag::builder()
+        .name("md-strike")
+        .strikethrough(true)
+        .build();
+    table.add(&strike);
+    let highlight = gtk::TextTag::builder().name("md-highlight").build();
+    highlight.set_background_rgba(Some(&gdk::RGBA::new(0.95, 0.83, 0.25, 0.35)));
+    table.add(&highlight);
+    let code = gtk::TextTag::builder()
+        .name("md-code")
+        .family("monospace")
+        .build();
+    code.set_background_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.16)));
+    table.add(&code);
+    let quote = gtk::TextTag::builder()
+        .name("md-quote")
+        .style(gtk::pango::Style::Italic)
+        .left_margin(16)
+        .build();
+    quote.set_foreground_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.85)));
+    table.add(&quote);
+    let link = gtk::TextTag::builder()
+        .name("md-link")
+        .underline(gtk::pango::Underline::Single)
+        .build();
+    link.set_foreground_rgba(Some(&gdk::RGBA::new(0.32, 0.5, 0.86, 1.0)));
+    table.add(&link);
+    let checked = gtk::TextTag::builder()
+        .name("md-checked")
+        .strikethrough(true)
+        .build();
+    checked.set_foreground_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.85)));
+    table.add(&checked);
+}
+
+fn content_tag_names(kind: SpanKind) -> &'static [&'static str] {
+    match kind {
+        SpanKind::Heading1 => &["md-h1"],
+        SpanKind::Heading2 => &["md-h2"],
+        SpanKind::Heading3 => &["md-h3"],
+        SpanKind::Bold => &["md-bold"],
+        SpanKind::Italic => &["md-italic"],
+        SpanKind::Strikethrough => &["md-strike"],
+        SpanKind::Highlight => &["md-highlight"],
+        SpanKind::InlineCode => &["md-code"],
+        SpanKind::Quote => &["md-quote"],
+        SpanKind::Link => &["md-link"],
+        SpanKind::ChecklistItem { checked: true } => &["md-checked"],
+        SpanKind::ChecklistItem { checked: false }
+        | SpanKind::BulletItem
+        | SpanKind::NumberedItem
+        | SpanKind::Divider => &[],
+    }
+}
+
+/// Recomputes every Markdown style tag over the whole buffer. Whole-buffer
+/// rather than incrementally invalidated on purpose: a delimiter change can
+/// affect styling beyond the edit point, and a stale tag is worse than a
+/// slightly wider recompute. Only ever calls `apply_tag_by_name`/
+/// `remove_tag_by_name` - GTK documents `changed` as firing for content
+/// changes and `apply-tag`/`remove-tag` as separate signals with their own
+/// default handlers, and the modified bit likewise only tracks content
+/// edits, so this can never mark the buffer modified, trigger autosave, or
+/// create an undo step for the user's actual text.
+fn recompute_markdown_styles(buffer: &sourceview5::Buffer) {
+    let start = buffer.start_iter();
+    let end = buffer.end_iter();
+    let text = buffer.text(&start, &end, true).to_string();
+
+    let clear_start = buffer.start_iter();
+    let clear_end = buffer.end_iter();
+    buffer.remove_tag_by_name(MARKDOWN_MARKER_TAG, &clear_start, &clear_end);
+    for tag in MARKDOWN_STYLE_TAGS {
+        buffer.remove_tag_by_name(tag, &clear_start, &clear_end);
+    }
+
+    for span in markdown_spans::compute_spans(&text) {
+        for marker in &span.marker_ranges {
+            apply_tag_range(buffer, MARKDOWN_MARKER_TAG, &text, marker.clone());
+        }
+        for tag in content_tag_names(span.kind) {
+            apply_tag_range(buffer, tag, &text, span.content_range.clone());
+        }
+    }
+}
+
+fn apply_tag_range(
+    buffer: &sourceview5::Buffer,
+    tag: &str,
+    text: &str,
+    range: std::ops::Range<usize>,
+) {
+    if range.start >= range.end {
+        return;
+    }
+    let start_char = byte_to_char(text, range.start) as i32;
+    let end_char = byte_to_char(text, range.end) as i32;
+    let start_iter = buffer.iter_at_offset(start_char);
+    let end_iter = buffer.iter_at_offset(end_char);
+    buffer.apply_tag_by_name(tag, &start_iter, &end_iter);
+}
+
+/// Debounces a style recompute after a real text edit. A short delay -
+/// quick enough to feel immediate, long enough that fast typing does not
+/// trigger a rescan on every keystroke.
+fn schedule_style_recompute(widgets: &Widgets) {
+    if let Some(source) = widgets.style_recompute_source.borrow_mut().take() {
+        source.remove();
+    }
+    let buffer = widgets.buffer.clone();
+    let source_slot = widgets.style_recompute_source.clone();
+    let source = glib::timeout_add_local_once(Duration::from_millis(120), move || {
+        source_slot.borrow_mut().take();
+        recompute_markdown_styles(&buffer);
+    });
+    *widgets.style_recompute_source.borrow_mut() = Some(source);
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ActiveFormats {
+    bold: bool,
+    italic: bool,
+}
+
+/// Determines which formats the toolbar should show as active, following
+/// the agreed rules precisely rather than a naive tag check at the raw
+/// cursor offset:
+///
+/// - A non-empty selection: active only if the format applies uniformly
+///   across the *entire* selection (the same rule `toggle_wrap` in
+///   `formatting.rs` already uses to decide "already applied").
+/// - No selection: the character immediately *before* the cursor
+///   (left-gravity, matching GTK's own `insert_at_cursor` tag-inheritance
+///   convention), falling back to the character immediately after only at
+///   the very start of a line/buffer.
+/// - An empty paragraph has no tagged character to inspect either way, so
+///   it always reads as inactive here; a future "sticky" toolbar state
+///   would be separate, explicit UI state, not something inferred from
+///   absent tags.
+/// - Always re-derived from the buffer's current tags, including after
+///   undo/redo - no separate toolbar state can desync from the buffer.
+fn active_formats_at(buffer: &sourceview5::Buffer) -> ActiveFormats {
+    if let Some((start, end)) = buffer.selection_bounds() {
+        return ActiveFormats {
+            bold: tag_covers_range(buffer, "md-bold", &start, &end),
+            italic: tag_covers_range(buffer, "md-italic", &start, &end),
+        };
+    }
+    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+    let probe = if cursor.starts_line() {
+        cursor
+    } else {
+        let mut before = cursor;
+        before.backward_char();
+        before
+    };
+    ActiveFormats {
+        bold: probe.has_tag(&tag_by_name(buffer, "md-bold")),
+        italic: probe.has_tag(&tag_by_name(buffer, "md-italic")),
+    }
+}
+
+fn tag_by_name(buffer: &sourceview5::Buffer, name: &str) -> gtk::TextTag {
+    buffer
+        .tag_table()
+        .lookup(name)
+        .unwrap_or_else(|| gtk::TextTag::builder().name(name).build())
+}
+
+fn tag_covers_range(
+    buffer: &sourceview5::Buffer,
+    name: &str,
+    start: &gtk::TextIter,
+    end: &gtk::TextIter,
+) -> bool {
+    let tag = tag_by_name(buffer, name);
+    let mut probe = *start;
+    while probe < *end {
+        if !probe.has_tag(&tag) {
+            return false;
+        }
+        if !probe.forward_char() {
+            break;
+        }
+    }
+    true
+}
+
+/// Reflects `active_formats_at` on the Bold/Italic toolbar buttons via the
+/// existing theme/accent-aware `brand-accent` CSS class, not
+/// `GtkToggleButton` state - the buttons are also wired to
+/// `app.format-bold`/`app.format-italic` via `set_action_name`, and a
+/// toggle button's own click-driven active state would fight this external,
+/// cursor-position-driven one.
+fn update_format_toolbar_state(widgets: &Widgets) {
+    let formats = active_formats_at(&widgets.buffer);
+    for (button, active) in [
+        (&widgets.format_bold_button, formats.bold),
+        (&widgets.format_italic_button, formats.italic),
+    ] {
+        if active {
+            button.add_css_class("brand-accent");
+        } else {
+            button.remove_css_class("brand-accent");
+        }
+    }
 }
 
 fn show_welcome_error(widgets: &Widgets, message: &str) {

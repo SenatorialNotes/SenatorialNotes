@@ -221,3 +221,69 @@ fn note_information_is_reachable_by_shortcut_header_button_and_context_menu() {
     assert!(source.contains("note_info_button.set_action_name(Some(\"app.note-info\"))"));
     assert!(source.contains("Note Information"));
 }
+
+/// Extracts the body of the named function (from its `fn` line to the next
+/// top-level `fn`), for the Editor V2 "rendering tags are purely
+/// presentational" checks below.
+fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let start = source
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("{name} should exist"));
+    let end = source[start..]
+        .find("\nfn ")
+        .map_or(source.len(), |offset| start + offset);
+    &source[start..end]
+}
+
+#[test]
+fn editor_v2_never_uses_gtktexttag_invisible() {
+    // The Stage C.0 prototype found a real, fatal GTK4 crash
+    // (gtktextbtree.c) when move-cursor is emitted on a buffer containing
+    // an invisible-tagged span. Editor V2 must never reach for it again -
+    // marker punctuation is dimmed (a foreground colour/alpha tag), never
+    // hidden.
+    let source = include_str!("../src/ui.rs");
+    assert!(!source.contains("set_invisible"));
+    assert!(!source.contains(".invisible(true)"));
+    assert!(!source.contains("\"invisible\""));
+}
+
+#[test]
+fn markdown_style_recompute_only_ever_applies_or_removes_tags() {
+    let source = include_str!("../src/ui.rs");
+    let recompute = function_body(source, "recompute_markdown_styles");
+    // Only tag operations - never a text mutation, which is the only way
+    // this pass could possibly touch buffer.text(), the modified bit,
+    // undo history, or (by having no path to any save function at all)
+    // autosave/updated_at.
+    for forbidden in [
+        ".insert(",
+        ".delete(",
+        ".set_text(",
+        "persist_active",
+        "save_note",
+        "save_encrypted_note",
+    ] {
+        assert!(
+            !recompute.contains(forbidden),
+            "recompute_markdown_styles must never contain {forbidden} - it is presentation only"
+        );
+    }
+    assert!(recompute.contains("apply_tag_by_name") || recompute.contains("apply_tag_range"));
+    assert!(recompute.contains("remove_tag_by_name"));
+
+    let apply_range = function_body(source, "apply_tag_range");
+    for forbidden in [".insert(", ".delete(", ".set_text("] {
+        assert!(!apply_range.contains(forbidden));
+    }
+}
+
+#[test]
+fn markdown_style_recompute_is_debounced_separately_from_autosave() {
+    let source = include_str!("../src/ui.rs");
+    let schedule = function_body(source, "schedule_style_recompute");
+    // A distinct SourceId slot and timer from schedule_body_save's, so
+    // restyling can never coalesce with, delay, or be mistaken for a save.
+    assert!(schedule.contains("style_recompute_source"));
+    assert!(!schedule.contains("pending.borrow"));
+}
