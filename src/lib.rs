@@ -19,4 +19,4 @@ pub mod watcher;
 pub use crypto::EncryptedSession;
 pub use error::{Error, Result};
 pub use model::{Note, NoteMetadata, NoteSummary};
-pub use vault::{FileStamp, TrashEntry, Vault};
+pub use vault::{FileStamp, NotebookEntry, TrashEntry, Vault};

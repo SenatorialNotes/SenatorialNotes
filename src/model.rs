@@ -19,6 +19,8 @@ pub struct NoteMetadata {
     pub tags: Vec<String>,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub archived: bool,
     #[serde(flatten)]
     pub unknown: BTreeMap<String, Value>,
 }
@@ -33,8 +35,47 @@ impl NoteMetadata {
             updated_at: now,
             tags: Vec::new(),
             pinned: false,
+            archived: false,
             unknown: BTreeMap::new(),
         }
+    }
+
+    /// Adds `tag` unless an existing tag already matches it case-insensitively
+    /// (after trimming). Returns `true` if a new tag was added. The casing a
+    /// user first saved a tag under is never rewritten just because a later
+    /// add used different casing.
+    pub fn add_tag(&mut self, tag: &str) -> bool {
+        let trimmed = tag.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let already_present = self
+            .tags
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(trimmed) || existing == trimmed);
+        // `eq_ignore_ascii_case` only folds ASCII; fall back to a full
+        // lowercase comparison so non-ASCII tags (e.g. accented words) are
+        // still deduplicated case-insensitively.
+        let already_present = already_present
+            || self
+                .tags
+                .iter()
+                .any(|existing| existing.to_lowercase() == trimmed.to_lowercase());
+        if already_present {
+            return false;
+        }
+        self.tags.push(trimmed.to_string());
+        true
+    }
+
+    /// Removes any tag matching `tag` case-insensitively. Returns `true` if a
+    /// tag was removed.
+    pub fn remove_tag(&mut self, tag: &str) -> bool {
+        let trimmed = tag.trim();
+        let before = self.tags.len();
+        self.tags
+            .retain(|existing| existing.to_lowercase() != trimmed.to_lowercase());
+        self.tags.len() != before
     }
 
     pub fn clear_sensitive(&mut self) {
@@ -138,6 +179,11 @@ pub struct NoteSummary {
     pub tags: Vec<String>,
     pub encrypted: bool,
     pub pinned: bool,
+    /// Whether the note is archived. For a locked encrypted note this is
+    /// always `false`: the real value lives inside the encrypted payload and
+    /// SenatorialNotes never guesses or leaks it while locked. See
+    /// [`NoteSummary::locked`].
+    pub archived: bool,
 }
 
 impl From<&Note> for NoteSummary {
@@ -158,11 +204,19 @@ impl From<&Note> for NoteSummary {
             tags: note.metadata.tags.clone(),
             encrypted: false,
             pinned: note.metadata.pinned,
+            archived: note.metadata.archived,
         }
     }
 }
 
 impl NoteSummary {
+    /// Placeholder summary for a locked encrypted note. Every field the
+    /// encrypted payload protects (title, preview, body, tags, pinned,
+    /// archived) is a fixed, non-committal value — never the real one and
+    /// never persisted separately — so locked notes can be listed without
+    /// decrypting them and without smart views built from a protected field
+    /// (Pinned, Archive, Recently Edited) claiming to know something they
+    /// cannot. See the "Locked encrypted notes" note in `SECURITY.md`.
     pub fn locked(id: Uuid, relative_path: PathBuf) -> Self {
         Self {
             id,
@@ -174,6 +228,7 @@ impl NoteSummary {
             tags: Vec::new(),
             encrypted: true,
             pinned: false,
+            archived: false,
         }
     }
 }

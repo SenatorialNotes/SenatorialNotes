@@ -53,6 +53,22 @@ pub fn validate_notebook_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Validates a single notebook path component (not a full path) supplied by
+/// the user for a rename or a new-child-notebook name, e.g. from a text
+/// entry. Rejects empty names, `.`/`..`, and any path separator.
+pub fn validate_notebook_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Err(Error::InvalidPath(name.to_string()));
+    }
+    Ok(trimmed.to_string())
+}
+
 pub fn ensure_relative_note_path(path: &Path) -> Result<PathBuf> {
     let checked = validate_notebook_path(path)?;
     if !matches!(

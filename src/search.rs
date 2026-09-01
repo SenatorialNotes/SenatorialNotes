@@ -53,6 +53,7 @@ mod tests {
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             encrypted: false,
             pinned: false,
+            archived: false,
         }
     }
 

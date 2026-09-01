@@ -1056,6 +1056,7 @@ dependencies = [
  "getrandom 0.3.4",
  "gtk4",
  "libadwaita",
+ "libc",
  "notify",
  "serde",
  "serde_json",

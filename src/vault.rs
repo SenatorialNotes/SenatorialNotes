@@ -12,9 +12,10 @@ use crate::crypto::{self, EncryptedSession};
 use crate::error::io_error;
 use crate::model::{Note, NoteSummary};
 use crate::paths::{
-    encrypted_note_filename, ensure_relative_note_path, note_filename, validate_notebook_path,
+    encrypted_note_filename, ensure_relative_note_path, note_filename, validate_notebook_name,
+    validate_notebook_path,
 };
-use crate::storage::atomic::atomic_write;
+use crate::storage::atomic::{atomic_write, rename_no_replace};
 use crate::{Error, Result};
 
 const NOTES_DIR: &str = "Notes";
@@ -49,6 +50,16 @@ impl FileStamp {
             Err(_) => false,
         }
     }
+}
+
+/// A notebook discovered under the vault's `Notes` directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotebookEntry {
+    /// Path relative to the vault's `Notes` directory, e.g. `Work/Projects`.
+    pub relative_path: PathBuf,
+    /// Notes (`.md`/`.snote`) directly inside this notebook - does not count
+    /// notes in nested child notebooks.
+    pub direct_note_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,6 +164,162 @@ impl Vault {
         let path = self.notes_dir().join(relative);
         create_private_directory(&path)?;
         Ok(path)
+    }
+
+    /// `Inbox` is created for every vault and is the fallback destination for
+    /// new notes and restored notes, so it cannot be renamed or deleted.
+    /// Nested notebooks under it (e.g. `Inbox/Drafts`) are not reserved.
+    pub fn is_reserved_notebook(relative: &Path) -> bool {
+        relative == Path::new(DEFAULT_NOTEBOOK)
+    }
+
+    /// Lists every notebook under `Notes`, including `Inbox`, as a flat list
+    /// of relative paths with their direct (non-recursive) note counts.
+    /// Symbolic links are skipped, matching `scan_notes`.
+    pub fn list_notebooks(&self) -> Result<Vec<NotebookEntry>> {
+        let mut notebooks = Vec::new();
+        collect_notebooks(&self.notes_dir(), Path::new(""), &mut notebooks)?;
+        notebooks.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(notebooks)
+    }
+
+    /// Renames a notebook in place. The new name is a single path component,
+    /// not a full path - the notebook stays where it is in the hierarchy,
+    /// only its own name changes. Refuses on `Inbox`, on a name that would
+    /// collide with an existing sibling, and on a name that would collide
+    /// with the reserved `Inbox` name.
+    pub fn rename_notebook(&self, relative: &Path, new_name: &str) -> Result<PathBuf> {
+        let relative = validate_notebook_path(relative)?;
+        if Self::is_reserved_notebook(&relative) {
+            return Err(Error::ReservedNotebook {
+                relative_path: relative,
+            });
+        }
+        reject_symlink_components(&self.notes_dir(), &relative)?;
+        let old_path = self.notes_dir().join(&relative);
+        if !old_path.is_dir() {
+            return Err(Error::InvalidPath(format!(
+                "notebook not found: {}",
+                old_path.display()
+            )));
+        }
+
+        let sanitized_name = validate_notebook_name(new_name)?;
+        let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+        let next_relative = parent_relative.join(&sanitized_name);
+        if next_relative == relative {
+            return Ok(relative);
+        }
+        if Self::is_reserved_notebook(&next_relative) {
+            return Err(Error::ReservedNotebook {
+                relative_path: next_relative,
+            });
+        }
+        let next_path = self.notes_dir().join(&next_relative);
+        if next_path.exists() {
+            return Err(Error::AlreadyExists(next_path));
+        }
+        fs::rename(&old_path, &next_path).map_err(|source| io_error(&next_path, source))?;
+        sync_directory(
+            next_path
+                .parent()
+                .ok_or_else(|| Error::InvalidPath(next_path.display().to_string()))?,
+        )?;
+        Ok(next_relative)
+    }
+
+    /// Deletes a notebook. Refuses on `Inbox`. Refuses, naming the note
+    /// count, if any `.md`/`.snote` file exists anywhere in the subtree.
+    /// Refuses, without deleting anything, if any *other* file or symbolic
+    /// link exists anywhere in the subtree - SenatorialNotes never
+    /// recursively destroys content it does not manage. Only when the whole
+    /// subtree is nothing but empty directories does it remove them,
+    /// leaf-first, one `fs::remove_dir` at a time (never `remove_dir_all`),
+    /// which gives a second safety net for free: `fs::remove_dir` itself
+    /// fails on anything that is not empty.
+    pub fn delete_notebook(&self, relative: &Path) -> Result<()> {
+        let relative = validate_notebook_path(relative)?;
+        if Self::is_reserved_notebook(&relative) {
+            return Err(Error::ReservedNotebook {
+                relative_path: relative,
+            });
+        }
+        reject_symlink_components(&self.notes_dir(), &relative)?;
+        let root = self.notes_dir().join(&relative);
+        if !root.is_dir() {
+            return Err(Error::InvalidPath(format!(
+                "notebook not found: {}",
+                root.display()
+            )));
+        }
+
+        let mut note_count = 0_usize;
+        let mut has_unmanaged = false;
+        scan_notebook_contents(&root, &mut note_count, &mut has_unmanaged)?;
+        if note_count > 0 {
+            return Err(Error::NotebookNotEmpty {
+                relative_path: relative,
+                note_count,
+            });
+        }
+        if has_unmanaged {
+            return Err(Error::NotebookHasUnmanagedContent {
+                relative_path: relative,
+            });
+        }
+
+        remove_empty_subtree(&root)?;
+        sync_directory(
+            root.parent()
+                .ok_or_else(|| Error::InvalidPath(root.display().to_string()))?,
+        )
+    }
+
+    /// Moves a note into `destination_notebook`, creating it if needed. The
+    /// note's filename (and therefore its UUID suffix) is unchanged, only its
+    /// containing directory moves. Never rewrites the note's content or
+    /// `updated_at` - this is a filesystem rename, nothing else - and works
+    /// identically for plaintext `.md` and encrypted `.snote` notes: the
+    /// encrypted container's authenticated header does not include the path,
+    /// so a location change never affects decryption (see
+    /// `docs/ENCRYPTED_NOTE_FORMAT.md`). Uses [`rename_no_replace`] so a
+    /// destination collision fails atomically instead of silently
+    /// overwriting an existing note.
+    pub fn move_note(
+        &self,
+        relative: &Path,
+        destination_notebook: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        let relative = ensure_relative_note_path(relative)?;
+        let source = self.note_path(&relative)?;
+        if !source.is_file() {
+            return Err(Error::NoteNotFound(source));
+        }
+
+        let destination_notebook = validate_notebook_path(destination_notebook.as_ref())?;
+        self.create_notebook(&destination_notebook)?;
+
+        let file_name = relative
+            .file_name()
+            .ok_or_else(|| Error::InvalidPath(relative.display().to_string()))?;
+        let next_relative = destination_notebook.join(file_name);
+        if next_relative == relative {
+            return Ok(relative);
+        }
+        let destination = self.note_path(&next_relative)?;
+
+        rename_no_replace(&source, &destination)?;
+        sync_directory(
+            destination
+                .parent()
+                .ok_or_else(|| Error::InvalidPath(destination.display().to_string()))?,
+        )?;
+        sync_directory(
+            source
+                .parent()
+                .ok_or_else(|| Error::InvalidPath(source.display().to_string()))?,
+        )?;
+        Ok(next_relative)
     }
 
     pub fn create_note(&self, title: &str, notebook: impl AsRef<Path>) -> Result<Note> {
@@ -739,6 +906,110 @@ fn reject_symlink_components(base: &Path, relative: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn collect_notebooks(
+    absolute_dir: &Path,
+    relative_dir: &Path,
+    notebooks: &mut Vec<NotebookEntry>,
+) -> Result<()> {
+    let entries = fs::read_dir(absolute_dir).map_err(|source| io_error(absolute_dir, source))?;
+    let mut direct_note_count = 0_usize;
+    let mut subdirectories = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error(absolute_dir, source))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| io_error(entry.path(), source))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            subdirectories.push(entry.file_name());
+        } else if file_type.is_file()
+            && matches!(
+                entry.path().extension().and_then(|value| value.to_str()),
+                Some("md" | "snote")
+            )
+        {
+            direct_note_count += 1;
+        }
+    }
+    if !relative_dir.as_os_str().is_empty() {
+        notebooks.push(NotebookEntry {
+            relative_path: relative_dir.to_path_buf(),
+            direct_note_count,
+        });
+    }
+    for name in subdirectories {
+        let child_relative = relative_dir.join(&name);
+        let child_absolute = absolute_dir.join(&name);
+        collect_notebooks(&child_absolute, &child_relative, notebooks)?;
+    }
+    Ok(())
+}
+
+/// Scans a notebook subtree for anything that would make deletion unsafe.
+/// `note_count` accumulates every `.md`/`.snote` file found anywhere in the
+/// subtree; `has_unmanaged` is set if any other file or symbolic link is
+/// found anywhere in the subtree. Neither is ever destroyed by the caller.
+fn scan_notebook_contents(
+    absolute: &Path,
+    note_count: &mut usize,
+    has_unmanaged: &mut bool,
+) -> Result<()> {
+    let entries = fs::read_dir(absolute).map_err(|source| io_error(absolute, source))?;
+    let mut subdirectories = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error(absolute, source))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| io_error(entry.path(), source))?;
+        if file_type.is_symlink() {
+            *has_unmanaged = true;
+        } else if file_type.is_dir() {
+            subdirectories.push(entry.path());
+        } else if file_type.is_file() {
+            let is_note = matches!(
+                entry.path().extension().and_then(|value| value.to_str()),
+                Some("md" | "snote")
+            );
+            if is_note {
+                *note_count += 1;
+            } else {
+                *has_unmanaged = true;
+            }
+        } else {
+            *has_unmanaged = true;
+        }
+    }
+    for child in subdirectories {
+        scan_notebook_contents(&child, note_count, has_unmanaged)?;
+    }
+    Ok(())
+}
+
+/// Removes `root` and every directory beneath it, leaf-first, using
+/// `fs::remove_dir` (never `remove_dir_all`). `fs::remove_dir` fails on any
+/// non-empty directory, so even a race between the safety scan above and
+/// this call cannot destroy something that appeared in between.
+fn remove_empty_subtree(root: &Path) -> Result<()> {
+    let entries = fs::read_dir(root).map_err(|source| io_error(root, source))?;
+    let mut subdirectories = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error(root, source))?;
+        if entry
+            .file_type()
+            .map_err(|source| io_error(entry.path(), source))?
+            .is_dir()
+        {
+            subdirectories.push(entry.path());
+        }
+    }
+    for child in subdirectories {
+        remove_empty_subtree(&child)?;
+    }
+    fs::remove_dir(root).map_err(|source| io_error(root, source))
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
