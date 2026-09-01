@@ -163,3 +163,61 @@ fn deleting_a_notebook_is_confirmed_and_never_uses_remove_dir_all() {
     assert!(source.contains("gtk::AlertDialog::builder()"));
     assert!(!source.contains("remove_dir_all"));
 }
+
+#[test]
+fn note_info_dialog_never_shows_a_locked_note_s_title_tags_or_word_count() {
+    let source = include_str!("../src/ui.rs");
+    let start = source
+        .find("fn present_note_info_dialog")
+        .expect("present_note_info_dialog should exist");
+    let end = source[start..]
+        .find("\nfn ")
+        .map_or(source.len(), |offset| start + offset);
+    let body = &source[start..end];
+    // The locked branch must only ever build its content from the summary
+    // (relative_path/id), never from a decrypted `Note` - there is no path
+    // in this function that can reach one while `active_snapshot` is `None`.
+    let none_arm_start = body
+        .find("None =>")
+        .expect("a None (locked) match arm must exist");
+    let none_arm = &body[none_arm_start..];
+    // The tuple-destructuring `Some((` (not a bare `Some(`, which also
+    // matches the unrelated `gtk::Label::new(Some("Encrypted · locked"))`
+    // call inside the locked branch itself) marks the start of the unlocked
+    // match arm.
+    let some_arm_start = none_arm
+        .find("Some((")
+        .expect("a Some (unlocked) match arm must exist");
+    let locked_branch = &none_arm[..some_arm_start];
+    for leak in ["note.metadata.title", "note.metadata.tags", "note.body"] {
+        assert!(
+            !locked_branch.contains(leak),
+            "the locked-note branch of the info dialog must never reference {leak}"
+        );
+    }
+    assert!(locked_branch.contains("Encrypted"));
+}
+
+#[test]
+fn next_and_previous_note_accelerators_do_not_collide_with_gtksourceview_defaults() {
+    let source = include_str!("../src/ui.rs");
+    // GtkSourceView binds Alt+Up/Down to move-lines and Alt+Left/Right to
+    // move-words by default; a global accelerator on the same combination
+    // would only ever fire when focus happens to be outside the editor.
+    for claimed in ["<Alt>Up", "<Alt>Down", "<Alt>Left", "<Alt>Right"] {
+        assert!(
+            !source.contains(&format!("&[\"{claimed}\"]")),
+            "{claimed} is already a GtkSourceView default keybinding and must not be reused as \
+             a global accelerator"
+        );
+    }
+}
+
+#[test]
+fn note_information_is_reachable_by_shortcut_header_button_and_context_menu() {
+    let source = include_str!("../src/ui.rs");
+    assert!(source.contains("\"app.note-info\""));
+    assert!(source.contains("\"app.context-note-info\""));
+    assert!(source.contains("note_info_button.set_action_name(Some(\"app.note-info\"))"));
+    assert!(source.contains("Note Information"));
+}

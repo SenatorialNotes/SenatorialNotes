@@ -687,6 +687,11 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     delete_button.set_tooltip_text(Some("Move note to Trash"));
     delete_button.update_property(&[gtk::accessible::Property::Label("Move note to Trash")]);
     header.pack_start(&delete_button);
+    let note_info_button = gtk::Button::from_icon_name("dialog-information-symbolic");
+    note_info_button.set_action_name(Some("app.note-info"));
+    note_info_button.set_tooltip_text(Some("Note information (Alt+Enter)"));
+    note_info_button.update_property(&[gtk::accessible::Property::Label("Note information")]);
+    header.pack_end(&note_info_button);
     let menu = application_menu();
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
@@ -1135,6 +1140,7 @@ fn application_menu() -> gio::Menu {
     security.append(Some("Remove Encryption…"), Some("app.remove-encryption"));
     menu.append_section(Some("Encrypted Note"), &security);
     let note = gio::Menu::new();
+    note.append(Some("Note Information"), Some("app.note-info"));
     note.append(Some("Move to Trash"), Some("app.move-to-trash"));
     menu.append_section(Some("Note"), &note);
     menu.append(Some("About SenatorialNotes"), Some("app.about"));
@@ -2720,6 +2726,43 @@ fn selected_row_target(widgets: &Widgets) -> Option<RowTarget> {
         .and_then(|row| widgets.selection.target_at(row.index()))
 }
 
+/// Moves the list selection by `direction` rows (`1` for next, `-1` for
+/// previous) and loads whatever it lands on. Works for both the note list
+/// and Trash, since it only depends on `widgets.selection`/`RowTarget`. If
+/// nothing is selected yet, selects the first row instead of moving.
+fn select_adjacent_note(direction: i32, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let target =
+        match selected_row_target(widgets).and_then(|target| widgets.selection.index_of(target)) {
+            Some(current_index) => {
+                let next_index = current_index as i32 + direction;
+                usize::try_from(next_index)
+                    .ok()
+                    .and_then(|index| widgets.selection.target_at(index as i32))
+            }
+            None => widgets.selection.target_at(0),
+        };
+    let Some(target) = target else {
+        return;
+    };
+    select_row_target(target, widgets);
+    match target {
+        RowTarget::Note(id) => load_note_by_id(id, state, widgets),
+        RowTarget::Trash(id) => show_trash_by_id(id, state, widgets),
+    }
+}
+
+/// The note the keyboard-driven Pin/Archive/Note Information actions should
+/// act on: the currently open note, or - for a locked encrypted note, which
+/// is never `active` - whatever is selected in the list.
+fn current_note_id(state: &Rc<RefCell<AppState>>) -> Option<Uuid> {
+    let state = state.borrow();
+    state
+        .active
+        .as_ref()
+        .map(ActiveDocument::id)
+        .or_else(|| state.flow.selected_note())
+}
+
 fn select_adjacent_after_removal(
     removed_index: usize,
     state: &Rc<RefCell<AppState>>,
@@ -2880,6 +2923,7 @@ fn note_context_menu(id: Uuid, pinned: bool, archived: bool, encrypted: bool) ->
     if !encrypted {
         append_targeted_menu_item(&menu, "Encrypt Note…", "app.context-encrypt", id);
     }
+    append_targeted_menu_item(&menu, "Note Information", "app.context-note-info", id);
     append_targeted_menu_item(&menu, "Move to Trash", "app.context-move-to-trash", id);
     menu
 }
@@ -4745,6 +4789,188 @@ fn connect_theme_updates(widgets: &Widgets) {
     });
 }
 
+/// Shows title/notebook/tags/timestamps/pinned/archived/encryption/word-and-
+/// character-count/vault-relative-path for the currently open (or, for a
+/// locked encrypted note, currently selected) note, with the UUID tucked
+/// into an "Advanced" expander out of the normal reading flow. A locked
+/// note shows only what a locked `NoteSummary` actually knows - never a
+/// guess at its protected fields (see the "Locked encrypted notes" note in
+/// `SECURITY.md`).
+fn present_note_info_dialog(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let summary = {
+        state
+            .borrow()
+            .notes
+            .iter()
+            .find(|summary| summary.id == id)
+            .cloned()
+    };
+    let Some(summary) = summary else {
+        return;
+    };
+    // A primitive-only snapshot, not a clone of the whole `Note` - the same
+    // discipline `update_active_summary` already uses, so this dialog does
+    // not keep an extra long-lived copy of decrypted content around.
+    let active_snapshot = {
+        state.borrow().active.as_ref().and_then(|active| {
+            (active.id() == id).then(|| {
+                let note = active.note();
+                (
+                    note.metadata.title.clone(),
+                    note.relative_path.clone(),
+                    note.metadata.tags.clone(),
+                    note.metadata.created_at,
+                    note.metadata.updated_at,
+                    note.metadata.pinned,
+                    note.metadata.archived,
+                    note.body.split_whitespace().count(),
+                    note.body.chars().count(),
+                    active.is_encrypted(),
+                )
+            })
+        })
+    };
+
+    let window = ApplicationWindow::builder()
+        .transient_for(&widgets.window)
+        .modal(true)
+        .title("Note Information")
+        .default_width(380)
+        .default_height(if active_snapshot.is_some() { 580 } else { 260 })
+        .build();
+    {
+        let target = window.clone();
+        let controller = gtk::EventControllerKey::new();
+        controller.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                target.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        window.add_controller(controller);
+    }
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&adw::HeaderBar::new());
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
+    content.set_margin_top(14);
+    content.set_margin_bottom(20);
+
+    match active_snapshot {
+        None => {
+            let notice = gtk::Label::new(Some(
+                "This note is encrypted and locked. Unlock it to see its details.",
+            ));
+            notice.set_wrap(true);
+            notice.set_xalign(0.0);
+            content.append(&notice);
+            content.append(&preference_row(
+                "Encryption",
+                &gtk::Label::new(Some("Encrypted · locked")),
+            ));
+            content.append(&info_advanced_expander(&summary.relative_path, id));
+        }
+        Some((
+            title,
+            relative_path,
+            tags,
+            created_at,
+            updated_at,
+            pinned,
+            archived,
+            words,
+            characters,
+            encrypted,
+        )) => {
+            content.append(&preference_row("Title", &gtk::Label::new(Some(&title))));
+            let notebook = relative_path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("Inbox")
+                .to_string();
+            content.append(&preference_row(
+                "Notebook",
+                &gtk::Label::new(Some(&notebook)),
+            ));
+            let tags = if tags.is_empty() {
+                "None".to_string()
+            } else {
+                tags.join(", ")
+            };
+            content.append(&preference_row("Tags", &gtk::Label::new(Some(&tags))));
+            content.append(&preference_row(
+                "Created",
+                &gtk::Label::new(Some(&format_timestamp(created_at))),
+            ));
+            content.append(&preference_row(
+                "Modified",
+                &gtk::Label::new(Some(&format_timestamp(updated_at))),
+            ));
+            content.append(&preference_row(
+                "Pinned",
+                &gtk::Label::new(Some(if pinned { "Yes" } else { "No" })),
+            ));
+            content.append(&preference_row(
+                "Archived",
+                &gtk::Label::new(Some(if archived { "Yes" } else { "No" })),
+            ));
+            content.append(&preference_row(
+                "Encryption",
+                &gtk::Label::new(Some(if encrypted {
+                    "Encrypted · unlocked"
+                } else {
+                    "Not encrypted"
+                })),
+            ));
+            content.append(&preference_row(
+                "Word count",
+                &gtk::Label::new(Some(&words.to_string())),
+            ));
+            content.append(&preference_row(
+                "Character count",
+                &gtk::Label::new(Some(&characters.to_string())),
+            ));
+            content.append(&info_advanced_expander(&relative_path, id));
+        }
+    }
+
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&content)
+        .build();
+    root.append(&scroll);
+    window.set_content(Some(&root));
+    window.present();
+}
+
+/// The note's vault-relative location and UUID, tucked into a collapsed
+/// expander since they matter far less often than the fields above it.
+fn info_advanced_expander(relative_path: &Path, id: Uuid) -> gtk::Expander {
+    let details = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    details.set_margin_top(8);
+    let location = gtk::Label::new(Some(&relative_path.display().to_string()));
+    location.set_wrap(true);
+    location.set_xalign(0.0);
+    details.append(&preference_row("Location in vault", &location));
+    let uuid_label = gtk::Label::new(Some(&id.to_string()));
+    uuid_label.set_selectable(true);
+    uuid_label.set_xalign(0.0);
+    details.append(&preference_row("UUID", &uuid_label));
+    let expander = gtk::Expander::new(Some("Advanced"));
+    expander.set_child(Some(&details));
+    expander
+}
+
+fn format_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.format("%Y-%m-%d %H:%M UTC").to_string()
+}
+
 fn show_preferences(application: &Application, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     let window = ApplicationWindow::builder()
         .application(application)
@@ -5138,6 +5364,99 @@ fn install_actions(
     }
     application.add_action(&focus_search);
     application.set_accels_for_action("app.focus-search", &["<Primary><Shift>f"]);
+
+    let focus_note_list = gio::SimpleAction::new("focus-note-list", None);
+    {
+        let note_list = widgets.note_list.clone();
+        focus_note_list.connect_activate(move |_, _| {
+            note_list.grab_focus();
+        });
+    }
+    application.add_action(&focus_note_list);
+    application.set_accels_for_action("app.focus-note-list", &["<Primary>1"]);
+
+    let focus_editor = gio::SimpleAction::new("focus-editor", None);
+    {
+        let editor = widgets.editor.clone();
+        focus_editor.connect_activate(move |_, _| {
+            editor.grab_focus();
+        });
+    }
+    application.add_action(&focus_editor);
+    application.set_accels_for_action("app.focus-editor", &["<Primary>2"]);
+
+    let next_note = gio::SimpleAction::new("next-note", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        next_note.connect_activate(move |_, _| select_adjacent_note(1, &state, &widgets));
+    }
+    application.add_action(&next_note);
+    // Not <Alt>Down: GtkSourceView already binds Alt+Up/Down to its own
+    // move-lines action, so a global accelerator there would only fire when
+    // focus happens to be outside the editor - confusing and inconsistent.
+    application.set_accels_for_action("app.next-note", &["<Primary>bracketright"]);
+
+    let previous_note = gio::SimpleAction::new("previous-note", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        previous_note.connect_activate(move |_, _| select_adjacent_note(-1, &state, &widgets));
+    }
+    application.add_action(&previous_note);
+    application.set_accels_for_action("app.previous-note", &["<Primary>bracketleft"]);
+
+    let toggle_pin = gio::SimpleAction::new("toggle-pin", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        toggle_pin.connect_activate(move |_, _| {
+            if let Some(id) = current_note_id(&state) {
+                toggle_note_flag(NoteFlag::Pinned, id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&toggle_pin);
+    application.set_accels_for_action("app.toggle-pin", &["<Primary><Shift>p"]);
+
+    let toggle_archived = gio::SimpleAction::new("toggle-archived", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        toggle_archived.connect_activate(move |_, _| {
+            if let Some(id) = current_note_id(&state) {
+                toggle_note_flag(NoteFlag::Archived, id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&toggle_archived);
+    application.set_accels_for_action("app.toggle-archived", &["<Primary><Shift>a"]);
+
+    let note_info = gio::SimpleAction::new("note-info", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        note_info.connect_activate(move |_, _| {
+            if let Some(id) = current_note_id(&state) {
+                present_note_info_dialog(id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&note_info);
+    application.set_accels_for_action("app.note-info", &["<Alt>Return"]);
+
+    let context_note_info =
+        gio::SimpleAction::new("context-note-info", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        context_note_info.connect_activate(move |_, parameter| {
+            if let Some(id) = uuid_parameter(parameter) {
+                present_note_info_dialog(id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&context_note_info);
 
     let move_to_trash = gio::SimpleAction::new("move-to-trash", None);
     {

@@ -24,6 +24,15 @@ All notable changes to SenatorialNotes will be documented here. The format follo
   Z-A) alongside the existing default (pinned-first, then recency, then
   title); explicit choices never rewrite note files.
 - Combined notebook + tag + search filtering.
+- A Note Information panel (title, notebook, tags, created/modified,
+  pinned, archived, encryption status, word/character count, with the
+  vault-relative path and UUID tucked into an Advanced expander), reachable
+  from a header button, the app/context menus, and `Alt+Return`. For a
+  locked encrypted note it shows only what a locked summary actually knows
+  (never a guess at its protected title/tags/body).
+- Keyboard: `Ctrl+Shift+N` new notebook, `Ctrl+1`/`Ctrl+2` focus the note
+  list/editor, `Ctrl+]`/`Ctrl+[` next/previous note, `Ctrl+Shift+P` pin,
+  `Ctrl+Shift+A` archive, `Alt+Return` note information.
 
 #### Changed
 
