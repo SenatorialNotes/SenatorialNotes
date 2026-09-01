@@ -168,6 +168,7 @@ fn clear_yaml_value(value: &mut Value) {
 pub struct NoteSummary {
     pub id: Uuid,
     pub title: String,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub relative_path: PathBuf,
     pub preview: String,
@@ -206,6 +207,7 @@ impl From<&Note> for NoteSummary {
         Self {
             id: note.metadata.id,
             title: note.metadata.title.clone(),
+            created_at: note.metadata.created_at,
             updated_at: note.metadata.updated_at,
             relative_path: note.relative_path.clone(),
             preview,
@@ -219,18 +221,39 @@ impl From<&Note> for NoteSummary {
     }
 }
 
+/// A short, deterministic, non-secret label for a locked note, derived only
+/// from its UUID (never its title/body/tags/other protected metadata).
+///
+/// Uses the same 8-hex-character short-UUID convention already used for
+/// on-disk filenames (`note_filename`/`encrypted_note_filename` in
+/// `paths.rs`), so it introduces no new identifier scheme — just surfaces
+/// the existing one, uppercased, in the UI. This lets a vault with several
+/// locked notes tell them apart ("Locked Note · A1B2C3D4" vs "· 91C2FEDA")
+/// without decrypting anything or persisting any new metadata: the UUID is
+/// already plaintext (it's the filename), so this reveals nothing that
+/// wasn't already visible on disk.
+pub(crate) fn locked_note_suffix(id: Uuid) -> String {
+    id.simple().to_string()[..8].to_uppercase()
+}
+
 impl NoteSummary {
     /// Placeholder summary for a locked encrypted note. Every field the
     /// encrypted payload protects (title, preview, body, tags, pinned,
-    /// archived) is a fixed, non-committal value — never the real one and
-    /// never persisted separately — so locked notes can be listed without
-    /// decrypting them and without smart views built from a protected field
-    /// (Pinned, Archive, Recently Edited) claiming to know something they
-    /// cannot. See the "Locked encrypted notes" note in `SECURITY.md`.
+    /// archived, created/modified timestamps) is a fixed, non-committal
+    /// value — never the real one and never persisted separately — so
+    /// locked notes can be listed without decrypting them and without smart
+    /// views built from a protected field (Pinned, Archive, Recently
+    /// Edited) claiming to know something they cannot. The title is the
+    /// sole exception: it is not "Locked Note" verbatim but "Locked Note ·
+    /// <suffix>" where `<suffix>` is derived only from the note's UUID (see
+    /// `locked_note_suffix`), so multiple locked notes remain distinguishable
+    /// in the sidebar. See the "Locked encrypted notes" note in
+    /// `SECURITY.md`.
     pub fn locked(id: Uuid, relative_path: PathBuf) -> Self {
         Self {
             id,
-            title: "Locked Note".into(),
+            title: format!("Locked Note · {}", locked_note_suffix(id)),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
             updated_at: DateTime::<Utc>::UNIX_EPOCH,
             relative_path,
             preview: "Encrypted — unlock to view".into(),
@@ -241,5 +264,54 @@ impl NoteSummary {
             archived: false,
             locked: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[test]
+    fn locked_note_labels_are_deterministic_and_distinguish_different_notes() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let summary_a1 = NoteSummary::locked(a, PathBuf::from("Inbox/a.snote"));
+        let summary_a2 = NoteSummary::locked(a, PathBuf::from("Inbox/a.snote"));
+        let summary_b = NoteSummary::locked(b, PathBuf::from("Inbox/b.snote"));
+
+        assert_eq!(
+            summary_a1.title, summary_a2.title,
+            "the same note's locked label must be stable across calls"
+        );
+        assert_ne!(
+            summary_a1.title, summary_b.title,
+            "two different notes must not share a locked label"
+        );
+    }
+
+    #[test]
+    fn locked_note_label_reveals_only_the_uuid_derived_suffix() {
+        let id = Uuid::new_v4();
+        let summary = NoteSummary::locked(id, PathBuf::from("Inbox/note.snote"));
+
+        assert!(summary.title.starts_with("Locked Note"));
+        let suffix = locked_note_suffix(id);
+        assert!(summary.title.ends_with(&suffix));
+        assert_eq!(suffix.len(), 8);
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
+        );
+
+        // The label carries no other protected data: body/tags/preview stay
+        // the fixed non-committal placeholders.
+        assert_eq!(summary.body, "");
+        assert!(summary.tags.is_empty());
+        assert_eq!(summary.preview, "Encrypted — unlock to view");
     }
 }

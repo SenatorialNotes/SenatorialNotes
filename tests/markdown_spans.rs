@@ -125,6 +125,38 @@ fn inline_code_suppresses_formatting_markers_inside_it() {
 }
 
 #[test]
+fn fenced_code_block_is_detected_and_suppresses_formatting_inside_it() {
+    let text = "before\n```\nlet x = **not bold**;\n*also not italic*\n```\nafter";
+    let spans = compute_spans(text);
+    let blocks = find_kind(&spans, SpanKind::CodeBlock);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        content(text, blocks[0]),
+        "let x = **not bold**;\n*also not italic*"
+    );
+    assert!(
+        find_kind(&spans, SpanKind::Bold).is_empty(),
+        "markers inside a fenced code block must never produce a Bold span"
+    );
+    assert!(
+        find_kind(&spans, SpanKind::Italic).is_empty(),
+        "markers inside a fenced code block must never produce an Italic span"
+    );
+}
+
+#[test]
+fn fenced_code_block_with_a_language_tag_and_empty_body_does_not_panic() {
+    for text in ["```rust\n```", "```\n```", "```", "```\nunterminated"] {
+        let _ = compute_spans(text); // must not panic
+    }
+    let with_language = "```rust\nfn main() {}\n```";
+    let spans = compute_spans(with_language);
+    let blocks = find_kind(&spans, SpanKind::CodeBlock);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(content(with_language, blocks[0]), "fn main() {}");
+}
+
+#[test]
 fn escaped_markers_are_not_interpreted() {
     let text = r"plain \*\*not bold\*\* plain";
     let spans = compute_spans(text);

@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::constants::VAULT_STATE_DIR;
 use crate::crypto::{self, EncryptedSession};
 use crate::error::io_error;
-use crate::model::{Note, NoteSummary};
+use crate::model::{Note, NoteSummary, locked_note_suffix};
 use crate::paths::{
     encrypted_note_filename, ensure_relative_note_path, note_filename, validate_notebook_name,
     validate_notebook_path,
@@ -607,9 +607,10 @@ impl Vault {
         let encrypted = relative.extension().and_then(|value| value.to_str()) == Some("snote");
         let (id, title) = if encrypted {
             let bytes = fs::read(&source).map_err(|error| io_error(&source, error))?;
+            let note_id = crypto::inspect_header(&bytes)?.note_id;
             (
-                crypto::inspect_header(&bytes)?.note_id,
-                "Locked Note".into(),
+                note_id,
+                format!("Locked Note · {}", locked_note_suffix(note_id)),
             )
         } else {
             let (note, _stamp) = self.load_note(&relative)?;
@@ -670,7 +671,7 @@ impl Vault {
                 continue;
             }
             let title = if record.encrypted {
-                "Locked Note".into()
+                format!("Locked Note · {}", locked_note_suffix(record.note_id))
             } else {
                 let markdown =
                     fs::read_to_string(&note_path).map_err(|error| io_error(&note_path, error))?;

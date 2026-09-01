@@ -32,6 +32,7 @@ pub enum SpanKind {
     Strikethrough,
     Highlight,
     InlineCode,
+    CodeBlock,
     Quote,
     BulletItem,
     NumberedItem,
@@ -59,12 +60,87 @@ pub struct Span {
 /// produces no span for that text, left exactly as typed.
 pub fn compute_spans(text: &str) -> Vec<Span> {
     let mut spans = Vec::new();
+    let code_blocks = find_fenced_code_blocks(text);
+    for block in &code_blocks {
+        spans.push(Span {
+            kind: SpanKind::CodeBlock,
+            marker_ranges: vec![block.open_fence.clone(), block.close_fence.clone()],
+            content_range: block.content.clone(),
+        });
+    }
+
     let mut line_start = 0;
     for line in text.split('\n') {
-        scan_line(text, line_start..line_start + line.len(), &mut spans);
+        let line_range = line_start..line_start + line.len();
+        // A fenced code block's lines (fences and content alike) are opaque
+        // to every other detector, exactly like inline code - nothing
+        // inside a code block is ever reinterpreted as another construct.
+        if !code_blocks
+            .iter()
+            .any(|block| block.full_range.contains(&line_range.start))
+        {
+            scan_line(text, line_range, &mut spans);
+        }
         line_start += line.len() + 1;
     }
     spans
+}
+
+struct FencedCodeBlock {
+    open_fence: Range<usize>,
+    close_fence: Range<usize>,
+    content: Range<usize>,
+    /// `open_fence.start..close_fence.end`, used to test whether a given
+    /// line falls inside this block.
+    full_range: Range<usize>,
+}
+
+/// Finds ```-delimited fenced code blocks. A fence line is any line whose
+/// trimmed content starts with three or more backticks (an optional
+/// language tag after the opening fence is treated as part of the marker,
+/// not the content). An opening fence with no matching closing fence before
+/// the end of the text is left unrecognised entirely, exactly like any
+/// other unmatched marker - it produces no span and is never rewritten.
+fn find_fenced_code_blocks(text: &str) -> Vec<FencedCodeBlock> {
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    for line in text.split('\n') {
+        lines.push(line_start..line_start + line.len());
+        line_start += line.len() + 1;
+    }
+
+    let mut blocks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let open = lines[i].clone();
+        if is_fence_line(&text[open.clone()])
+            && let Some(j) = (i + 1..lines.len()).find(|&j| is_fence_line(&text[lines[j].clone()]))
+        {
+            let close = lines[j].clone();
+            // Content is the (possibly empty) span of whole lines strictly
+            // between the two fence lines, excluding the newlines
+            // immediately adjacent to each fence.
+            let content = if j == i + 1 {
+                open.end..open.end
+            } else {
+                lines[i + 1].start..lines[j - 1].end
+            };
+            blocks.push(FencedCodeBlock {
+                full_range: open.start..close.end,
+                open_fence: open,
+                close_fence: close,
+                content,
+            });
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    blocks
+}
+
+fn is_fence_line(line: &str) -> bool {
+    line.trim_start().starts_with("```")
 }
 
 fn scan_line(text: &str, line: Range<usize>, spans: &mut Vec<Span>) {

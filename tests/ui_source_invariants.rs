@@ -287,3 +287,175 @@ fn markdown_style_recompute_is_debounced_separately_from_autosave() {
     assert!(schedule.contains("style_recompute_source"));
     assert!(!schedule.contains("pending.borrow"));
 }
+
+#[test]
+fn gtksourceview_builtin_syntax_highlighting_stays_disabled() {
+    // Editor V2's own markdown_spans-driven tags are the single source of
+    // Markdown visual styling. A real-machine acceptance pass found Ctrl+B
+    // visually producing bold+italic instead of bold-only, most plausibly
+    // from GtkSourceView's own independent syntax highlighting stacking on
+    // top; a dedicated pipeline test (tests/formatting_pipeline.rs) proves
+    // the formatting/rendering logic itself produces bold-only for that
+    // input, so re-enabling this must not happen without re-auditing that
+    // interaction.
+    let source = include_str!("../src/ui.rs");
+    assert!(source.contains("buffer.set_highlight_syntax(false)"));
+}
+
+#[test]
+fn toolbar_active_state_updates_are_deferred_off_the_signal_stack() {
+    // `cursor-position` is a GObject property notify, which fires
+    // synchronously wherever the cursor moves - including nested inside
+    // GtkTextBuffer::delete/insert while a formatting action is still on
+    // the stack. Mutating the toolbar buttons' CSS classes directly from
+    // that handler risks a GTK layout/allocation race (a real-machine
+    // acceptance pass hit "Trying to snapshot GtkGizmo ... without a
+    // current allocation" while spam-triggering formatting controls); the
+    // handler must only ever schedule the update, never perform it inline.
+    let source = include_str!("../src/ui.rs");
+    assert!(
+        source.contains("connect_cursor_position_notify(move |_| schedule_format_toolbar_update")
+    );
+    let schedule = function_body(source, "schedule_format_toolbar_update");
+    assert!(schedule.contains("idle_add_local_once"));
+}
+
+#[test]
+fn changing_sort_order_persists_the_choice_before_refreshing_the_visible_list() {
+    let source = include_str!("../src/ui.rs");
+    let start = source
+        .find("let set_sort_order = gio::SimpleAction::new_stateful")
+        .expect("set_sort_order action should exist");
+    let end = source[start..]
+        .find("\n    application.add_action(&set_sort_order);")
+        .map_or(source.len(), |offset| start + offset);
+    let body = &source[start..end];
+    let config_set_at = body
+        .find("state.config.sort_order = Some(order)")
+        .expect("activating set-sort-order must update state.config.sort_order");
+    let render_at = body
+        .find("render_note_list(&state, &widgets)")
+        .expect("activating set-sort-order must refresh the visible list");
+    assert!(
+        config_set_at < render_at,
+        "state.config.sort_order must be updated before render_note_list reads it, so the \
+         list is never rebuilt against the stale sort order"
+    );
+    assert!(
+        body.contains("state.config.save()"),
+        "an explicit sort choice must persist across restarts"
+    );
+}
+
+#[test]
+fn filtered_notes_reads_the_persisted_sort_order() {
+    let source = include_str!("../src/ui.rs");
+    let filtered = function_body(source, "filtered_notes");
+    assert!(
+        filtered.contains("state.config.sort_order"),
+        "filtered_notes must read the user's persisted sort choice, not a hardcoded order"
+    );
+    assert!(filtered.contains("sort_notes(&mut notes"));
+}
+
+#[test]
+fn render_note_list_reselects_the_previously_selected_note_by_uuid_after_resorting() {
+    let source = include_str!("../src/ui.rs");
+    let render = function_body(source, "render_note_list");
+    // The pre-render selected note id is captured, then looked back up by
+    // UUID in the freshly (re)sorted row order - never by a stale numeric
+    // index, which a sort-order change would invalidate.
+    assert!(render.contains("selected_note"));
+    assert!(render.contains("widgets.selection.index_of(RowTarget::Note(id))"));
+}
+
+#[test]
+fn update_active_summary_syncs_the_real_title_and_preview_while_unlocked() {
+    let source = include_str!("../src/ui.rs");
+    let body = function_body(source, "update_active_summary");
+    // This function only ever runs against `state.active`, which for an
+    // encrypted note only ever holds it while unlocked - so once a note is
+    // open, its sidebar row must reflect the real, current title/preview,
+    // not the locked placeholder. No `if !encrypted` (or `if encrypted`)
+    // gate may skip the summary/row-widget sync below.
+    assert!(
+        !body.contains("if !encrypted"),
+        "update_active_summary must not skip syncing the sidebar row for an \
+         open, unlocked encrypted note"
+    );
+    assert!(
+        !body.contains("if encrypted"),
+        "update_active_summary must not special-case the preview text for \
+         an open, unlocked encrypted note"
+    );
+    assert!(body.contains("summary.title = title.clone()"));
+    assert!(body.contains("summary.preview = preview.clone()"));
+    assert!(body.contains("row_widgets.title.set_label(&title)"));
+    assert!(
+        body.contains("summary.locked = false"),
+        "an open, unlocked encrypted note's summary must transition out of \
+         the locked state, the reverse of what lock_all_encrypted does"
+    );
+}
+
+#[test]
+fn locked_note_rows_get_their_uuid_derived_label_not_a_bare_locked_note_string() {
+    let source = include_str!("../src/ui.rs");
+    // `lock_all_encrypted` must reuse the exact label `NoteSummary::locked`
+    // computed (its anonymous, UUID-derived suffix) for the row it directly
+    // relabels, never a bare "Locked Note" literal that would make every
+    // locked note indistinguishable again.
+    let lock_all = function_body(source, "lock_all_encrypted");
+    assert!(!lock_all.contains("row_widgets.title.set_label(\"Locked Note\")"));
+    assert!(lock_all.contains("locked_titles"));
+}
+
+#[test]
+fn switching_to_a_view_never_prompts_for_a_password_on_its_own() {
+    let source = include_str!("../src/ui.rs");
+    // Automatic fallback selection (landing on whatever note sorts first
+    // when a view is opened, or on an adjacent note after one is removed)
+    // must never call the password-prompting entry point directly - only
+    // `select_note_without_prompting_if_locked`, which shows a locked note
+    // as selected without launching its unlock dialog. A real-machine
+    // acceptance pass found that switching to Inbox could pop a password
+    // prompt for whichever encrypted note happened to sort first; this
+    // pins the fix so it cannot silently regress.
+    let select_first_row = function_body(source, "select_first_row");
+    assert!(
+        select_first_row.contains("select_note_without_prompting_if_locked(id, state, widgets)")
+    );
+    assert!(!select_first_row.contains("=> load_note_by_id(id, state, widgets)"));
+
+    let select_adjacent_after_removal = function_body(source, "select_adjacent_after_removal");
+    assert!(
+        select_adjacent_after_removal
+            .contains("select_note_without_prompting_if_locked(id, state, widgets)")
+    );
+    assert!(!select_adjacent_after_removal.contains("=> load_note_by_id(id, state, widgets)"));
+
+    // The non-prompting path must still show the locked placeholder (so the
+    // note reads as locked, not silently blank), it just must not launch
+    // `present_password_dialog` unless the caller asked for that.
+    let open_note_by_id = function_body(source, "open_note_by_id");
+    assert!(open_note_by_id.contains("show_locked_placeholder(widgets)"));
+    assert!(open_note_by_id.contains("if !prompt_if_locked"));
+}
+
+#[test]
+fn inbox_notebook_directory_name_is_unchanged_only_its_display_label_moved_to_unfiled() {
+    // Issue #7: the storage directory must stay named "Inbox" for backward
+    // compatibility with existing vaults - only the UI-facing label changes
+    // to "Unfiled". `Vault::DEFAULT_NOTEBOOK`/`is_reserved_notebook` must
+    // never be touched by this cosmetic change.
+    let vault_source = include_str!("../src/vault.rs");
+    assert!(vault_source.contains(r#"const DEFAULT_NOTEBOOK: &str = "Inbox";"#));
+
+    let ui_source = include_str!("../src/ui.rs");
+    assert!(
+        !ui_source.contains(r#"sidebar_button("Inbox""#),
+        "the Inbox sidebar row must display \"Unfiled\", not the raw notebook name"
+    );
+    assert!(ui_source.contains(r#"sidebar_button("Unfiled""#));
+    assert!(ui_source.contains(r#"switch_view(ViewMode::Notebook(PathBuf::from("Inbox"))"#));
+}

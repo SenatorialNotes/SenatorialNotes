@@ -6,7 +6,7 @@
 //! processed without trying to borrow the application model.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
@@ -29,9 +29,18 @@ pub enum ViewMode {
 
 impl ViewMode {
     /// Heading shown above the note list for this view.
+    ///
+    /// The reserved top-level `Inbox` notebook (see
+    /// `Vault::is_reserved_notebook`) displays as "Unfiled" - a friendlier
+    /// name for the fallback/default notebook - while its on-disk directory
+    /// stays named `Inbox` for backward compatibility with existing vaults.
+    /// A user-created notebook that happens to be *nested* under another
+    /// notebook and literally named "Inbox" (e.g. `Work/Inbox`) is a
+    /// distinct, non-reserved notebook and keeps its own name verbatim.
     pub fn heading(&self) -> String {
         match self {
             Self::AllNotes => "All Notes".to_string(),
+            Self::Notebook(path) if path.as_path() == Path::new("Inbox") => "Unfiled".to_string(),
             Self::Notebook(path) => path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -280,9 +289,24 @@ mod tests {
         let nested = ViewMode::Notebook(std::path::PathBuf::from("Work/Projects"));
         assert_eq!(nested.heading(), "Projects");
         assert_eq!(nested.search_placeholder(), "Search Projects");
+    }
 
+    #[test]
+    fn reserved_top_level_inbox_notebook_displays_as_unfiled() {
+        // The on-disk directory stays "Inbox" (see `Vault::DEFAULT_NOTEBOOK`
+        // and `is_reserved_notebook`) - only the UI-facing heading changes.
         let top_level = ViewMode::Notebook(std::path::PathBuf::from("Inbox"));
-        assert_eq!(top_level.heading(), "Inbox");
+        assert_eq!(top_level.heading(), "Unfiled");
+        assert_eq!(top_level.search_placeholder(), "Search Unfiled");
+    }
+
+    #[test]
+    fn a_nested_notebook_literally_named_inbox_keeps_its_own_name() {
+        // Only the reserved *top-level* Inbox is renamed for display; a
+        // user-created nested notebook that happens to share the name is a
+        // distinct, non-reserved notebook and must not be relabeled.
+        let nested_inbox = ViewMode::Notebook(std::path::PathBuf::from("Work/Inbox"));
+        assert_eq!(nested_inbox.heading(), "Inbox");
     }
 
     #[test]

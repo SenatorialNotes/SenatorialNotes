@@ -212,6 +212,13 @@ struct Widgets {
     /// cursor-position-driven one.
     format_bold_button: gtk::Button,
     format_italic_button: gtk::Button,
+    /// The single outstanding idle-deferred toolbar active-state update, if
+    /// one is armed. See `schedule_format_toolbar_update`.
+    format_toolbar_update_source: Rc<RefCell<Option<glib::SourceId>>>,
+    /// The last state actually applied to the toolbar buttons, so a
+    /// same-state re-notification (cursor moves within a run of identically
+    /// formatted text) never re-touches the buttons' CSS classes.
+    format_toolbar_state: Rc<Cell<ActiveFormats>>,
     save_status: gtk::Label,
     locked_copy: gtk::Label,
     trash_detail_title: gtk::Label,
@@ -457,9 +464,18 @@ fn build_application(application: &Application) {
     }
 
     {
+        // `cursor-position` is a GObject property notify, which GObject
+        // always fires synchronously at the point the property changes -
+        // here, from inside GtkTextBuffer::delete/insert while
+        // apply_format_to_buffer is still on the stack. Mutating other
+        // widgets (the toolbar buttons' CSS classes) directly from this
+        // handler would do it re-entrantly, nested inside an active buffer
+        // mutation; schedule_format_toolbar_update defers the actual work
+        // to an idle callback so it always runs as its own top-level main
+        // loop turn instead (see that function's doc comment).
         let widgets = widgets.clone();
         let buffer = widgets.buffer.clone();
-        buffer.connect_cursor_position_notify(move |_| update_format_toolbar_state(&widgets));
+        buffer.connect_cursor_position_notify(move |_| schedule_format_toolbar_update(&widgets));
     }
 
     {
@@ -593,6 +609,9 @@ fn build_application(application: &Application) {
             cancel_all_timers(&pending);
             cancel_pending_selection(&widgets);
             if let Some(source) = widgets.style_recompute_source.borrow_mut().take() {
+                source.remove();
+            }
+            if let Some(source) = widgets.format_toolbar_update_source.borrow_mut().take() {
                 source.remove();
             }
             if persist_active(&state, &widgets, true) {
@@ -764,8 +783,11 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     all_notes.add_css_class("sidebar-selected");
     all_notes.set_tooltip_text(Some("Show every note in this vault"));
     sidebar.append(&all_notes);
-    let inbox = sidebar_button("Inbox", "mail-inbox-symbolic");
-    inbox.set_tooltip_text(Some("Show notes in the Inbox notebook"));
+    // Displayed as "Unfiled" - the on-disk notebook directory stays named
+    // "Inbox" for backward compatibility with existing vaults; only the
+    // UI-facing label changes. See `ViewMode::heading`.
+    let inbox = sidebar_button("Unfiled", "mail-inbox-symbolic");
+    inbox.set_tooltip_text(Some("Show notes not filed into another notebook"));
     sidebar.append(&inbox);
     let pinned = sidebar_button("Pinned", "emblem-favorite-symbolic");
     pinned.set_tooltip_text(Some("Show pinned notes"));
@@ -981,10 +1003,22 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     let (formatting_bar, format_bold_button, format_italic_button) = build_formatting_bar();
     editor_box.append(&formatting_bar);
     let buffer = sourceview5::Buffer::new(None::<&gtk::TextTagTable>);
+    // Editor V2's own markdown_spans-driven tags (registered below) are now
+    // the single, deliberate, tested source of Markdown visual styling.
+    // GtkSourceView's built-in language-based syntax highlighting is left
+    // disabled: two independent systems assigning Pango attributes (weight,
+    // style) to the same text is exactly the kind of interaction that is
+    // very hard to reason about precisely, and a real-machine acceptance
+    // pass found Ctrl+B visually producing bold+italic instead of bold-only
+    // - most plausibly this stacking, since Editor V2's own span computation
+    // was verified in isolation (and by a dedicated pipeline test) to
+    // produce Bold only for that exact input. `set_language` is still set
+    // for GtkSourceView's other language-aware behaviour (e.g. matching
+    // bracket detection), just not its highlighting.
     if let Some(language) = sourceview5::LanguageManager::default().language("markdown") {
         buffer.set_language(Some(&language));
-        buffer.set_highlight_syntax(true);
     }
+    buffer.set_highlight_syntax(false);
     buffer.set_highlight_matching_brackets(true);
     register_markdown_style_tags(&buffer);
     let editor = sourceview5::View::with_buffer(&buffer);
@@ -1146,6 +1180,8 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
             formatting_bar,
             format_bold_button,
             format_italic_button,
+            format_toolbar_update_source: Rc::new(RefCell::new(None)),
+            format_toolbar_state: Rc::new(Cell::new(ActiveFormats::default())),
             save_status,
             locked_copy,
             trash_detail_title,
@@ -1583,12 +1619,48 @@ fn select_first_row(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     };
     select_row_target(target, widgets);
     match target {
-        RowTarget::Note(id) => load_note_by_id(id, state, widgets),
+        RowTarget::Note(id) => select_note_without_prompting_if_locked(id, state, widgets),
         RowTarget::Trash(id) => show_trash_by_id(id, state, widgets),
     }
 }
 
+/// Loads note `id` and always prompts for its password immediately if it is
+/// a locked encrypted note. Reserved for calls that come from the user
+/// directly acting on *this specific* note - clicking its row, pressing
+/// next/previous with it as the target, or pressing the "Unlock Note"
+/// button - never from an automatic fallback selection. See
+/// `open_note_by_id`'s doc comment for why that distinction matters.
 fn load_note_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    open_note_by_id(id, state, widgets, true);
+}
+
+/// Loads note `id` and selects it in the sidebar, but - when it is a locked
+/// encrypted note - shows the locked placeholder (with its own "Unlock
+/// Note" button) without launching the password dialog.
+///
+/// Used for automatic fallback selection: switching to a notebook or smart
+/// view (including Inbox) and picking whatever note sorts first, or picking
+/// an adjacent note after the previously-selected one was removed. In both
+/// cases the note that ends up selected is incidental to what the user
+/// actually asked for - browsing to a view, or deleting something else -
+/// not a specific note they chose to open. Auto-prompting there is exactly
+/// how merely switching to Inbox (or any view) could end up launching a
+/// password dialog for whichever encrypted note happened to be first: see
+/// the "Inbox never requires a password" note in `SECURITY.md`.
+fn select_note_without_prompting_if_locked(
+    id: Uuid,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+) {
+    open_note_by_id(id, state, widgets, false);
+}
+
+fn open_note_by_id(
+    id: Uuid,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    prompt_if_locked: bool,
+) {
     let (vault, summary) = {
         let state = state.borrow();
         let Some(vault) = state.vault.clone() else {
@@ -1610,6 +1682,9 @@ fn load_note_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
             return;
         }
         show_locked_placeholder(widgets);
+        if !prompt_if_locked {
+            return;
+        }
         let state_for_unlock = state.clone();
         let widgets_for_unlock = widgets.clone();
         let relative = summary.relative_path.clone();
@@ -1782,7 +1857,7 @@ fn display_document(document: ActiveDocument, state: &Rc<RefCell<AppState>>, wid
     // first edit; loading is already suppressed above, so the debounced
     // recompute wired to buffer::changed would otherwise never fire here.
     recompute_markdown_styles(&widgets.buffer);
-    update_format_toolbar_state(widgets);
+    schedule_format_toolbar_update(widgets);
     widgets.document_stack.set_visible_child_name("editor");
     widgets.save_status.set_label(if encrypted {
         "Unlocked · encrypted at rest"
@@ -2103,25 +2178,30 @@ fn update_active_summary(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                 note.metadata.title.clone(),
                 note.body.clone(),
                 note.relative_path.clone(),
-                active.is_encrypted(),
                 note.metadata.pinned,
                 note.metadata.archived,
+                note.metadata.created_at,
                 note.metadata.updated_at,
                 note.metadata.tags.clone(),
             )
         })
     };
-    let Some((id, title, body, path, encrypted, pinned, archived, updated_at, tags)) =
+    let Some((id, title, body, path, pinned, archived, created_at, updated_at, tags)) =
         active_snapshot
     else {
         return;
     };
+    // This function only ever runs against `state.active`, which - for an
+    // encrypted note - only ever holds it while unlocked. Its real,
+    // already-decrypted body is exactly as available as the plaintext
+    // case, so the preview is computed the same way for both; the summary
+    // this function updates is a purely in-memory Vec (never written to
+    // disk or cache), so showing it here never creates a plaintext side
+    // channel - it only reflects what is already decrypted and displayed
+    // in the open editor. See the "Locked encrypted notes" note in
+    // `SECURITY.md`.
     let preview_limit = { state.borrow().config.appearance.note_preview_length };
-    let preview = if encrypted {
-        "Encrypted — unlock to view".into()
-    } else {
-        truncate_preview(&body, preview_limit)
-    };
+    let preview = truncate_preview(&body, preview_limit);
     if let Some(summary) = state
         .borrow_mut()
         .notes
@@ -2131,29 +2211,25 @@ fn update_active_summary(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
         summary.relative_path = path;
         summary.pinned = pinned;
         summary.archived = archived;
+        summary.created_at = created_at;
         summary.updated_at = updated_at;
         // The note is open and decrypted, so its true protected metadata is
         // known again - this is the one place a locked summary transitions
-        // back to unlocked (the reverse happens in `lock_all_encrypted`).
+        // back to unlocked (the reverse happens in `lock_all_encrypted`,
+        // which resets every field this function sets back to the exact
+        // `NoteSummary::locked()` placeholder).
         summary.locked = false;
-        // Keep locked encrypted summaries private even during an unlocked
-        // session; this also prevents plaintext from entering persistent or
-        // list-level search data.
-        if !encrypted {
-            summary.title = title.clone();
-            summary.preview = preview.clone();
-            summary.body = body.clone();
-            summary.tags = tags.clone();
-        }
+        summary.title = title.clone();
+        summary.preview = preview.clone();
+        summary.body = body.clone();
+        summary.tags = tags.clone();
     }
     let row_widgets = { widgets.row_widgets.borrow().get(&id).cloned() };
     if let Some(row_widgets) = row_widgets {
         row_widgets.pin.set_visible(pinned);
         row_widgets.archived.set_visible(archived);
-        if !encrypted {
-            row_widgets.title.set_label(&title);
-            row_widgets.preview.set_label(&preview);
-        }
+        row_widgets.title.set_label(&title);
+        row_widgets.preview.set_label(&preview);
     }
 }
 
@@ -2830,7 +2906,7 @@ fn select_adjacent_after_removal(
     };
     select_row_target(target, widgets);
     match target {
-        RowTarget::Note(id) => load_note_by_id(id, state, widgets),
+        RowTarget::Note(id) => select_note_without_prompting_if_locked(id, state, widgets),
         RowTarget::Trash(id) => show_trash_by_id(id, state, widgets),
     }
 }
@@ -3296,11 +3372,10 @@ fn present_move_to_notebook_dialog(id: Uuid, state: &Rc<RefCell<AppState>>, widg
             .components()
             .count()
             .saturating_sub(1);
-        let name = notebook
-            .relative_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("Notebook");
+        // Reuses the same Inbox -> "Unfiled" display mapping as the
+        // sidebar/Note Information panel, so this list never shows the raw
+        // on-disk "Inbox" name.
+        let name = ViewMode::Notebook(notebook.relative_path.clone()).heading();
         let row = gtk::ListBoxRow::new();
         row.set_activatable(true);
         let label = gtk::Label::new(Some(&format!("{}{}", "    ".repeat(depth), name)));
@@ -4092,11 +4167,13 @@ fn lock_all_encrypted(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     // same non-committal placeholder a fresh scan would produce, so nothing
     // that was true a moment ago is still displayed as true. See the "Locked
     // encrypted notes" note in SECURITY.md.
+    let mut locked_titles = std::collections::HashMap::new();
     {
         let mut state = state.borrow_mut();
         for (id, relative_path) in &newly_locked {
             if let Some(summary) = state.notes.iter_mut().find(|summary| summary.id == *id) {
                 *summary = NoteSummary::locked(*id, relative_path.clone());
+                locked_titles.insert(*id, summary.title.clone());
             }
         }
     }
@@ -4113,7 +4190,13 @@ fn lock_all_encrypted(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
         for (id, _) in &newly_locked {
             let row_widgets = { widgets.row_widgets.borrow().get(id).cloned() };
             if let Some(row_widgets) = row_widgets {
-                row_widgets.title.set_label("Locked Note");
+                // Reuse the exact label `NoteSummary::locked` just computed
+                // above (its anonymous, UUID-derived suffix) rather than a
+                // bare "Locked Note" literal, so this row stays
+                // distinguishable from every other locked note in the list.
+                if let Some(title) = locked_titles.get(id) {
+                    row_widgets.title.set_label(title);
+                }
                 row_widgets.preview.set_label("Encrypted — unlock to view");
                 row_widgets.pin.set_visible(false);
                 row_widgets.archived.set_visible(false);
@@ -4935,12 +5018,13 @@ fn present_note_info_dialog(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &W
             encrypted,
         )) => {
             content.append(&preference_row("Title", &gtk::Label::new(Some(&title))));
+            // Reuses `ViewMode::heading`'s Inbox -> "Unfiled" display mapping
+            // so this panel never shows the raw on-disk "Inbox" name the
+            // sidebar no longer does.
             let notebook = relative_path
                 .parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str())
-                .unwrap_or("Inbox")
-                .to_string();
+                .map(|parent| ViewMode::Notebook(parent.to_path_buf()).heading())
+                .unwrap_or_else(|| ViewMode::Notebook(PathBuf::from("Inbox")).heading());
             content.append(&preference_row(
                 "Notebook",
                 &gtk::Label::new(Some(&notebook)),
@@ -5961,6 +6045,7 @@ const MARKDOWN_STYLE_TAGS: &[&str] = &[
     "md-strike",
     "md-highlight",
     "md-code",
+    "md-codeblock",
     "md-quote",
     "md-link",
     "md-checked",
@@ -6018,6 +6103,12 @@ fn register_markdown_style_tags(buffer: &sourceview5::Buffer) {
         .build();
     code.set_background_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.16)));
     table.add(&code);
+    let code_block = gtk::TextTag::builder()
+        .name("md-codeblock")
+        .family("monospace")
+        .build();
+    code_block.set_background_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.16)));
+    table.add(&code_block);
     let quote = gtk::TextTag::builder()
         .name("md-quote")
         .style(gtk::pango::Style::Italic)
@@ -6049,6 +6140,7 @@ fn content_tag_names(kind: SpanKind) -> &'static [&'static str] {
         SpanKind::Strikethrough => &["md-strike"],
         SpanKind::Highlight => &["md-highlight"],
         SpanKind::InlineCode => &["md-code"],
+        SpanKind::CodeBlock => &["md-codeblock"],
         SpanKind::Quote => &["md-quote"],
         SpanKind::Link => &["md-link"],
         SpanKind::ChecklistItem { checked: true } => &["md-checked"],
@@ -6197,9 +6289,15 @@ fn tag_covers_range(
 /// `GtkToggleButton` state - the buttons are also wired to
 /// `app.format-bold`/`app.format-italic` via `set_action_name`, and a
 /// toggle button's own click-driven active state would fight this external,
-/// cursor-position-driven one.
+/// cursor-position-driven one. Only touches a button's CSS class when its
+/// state actually changed since the last call, so a burst of
+/// same-formatting cursor moves does not repeatedly toggle the same class.
 fn update_format_toolbar_state(widgets: &Widgets) {
     let formats = active_formats_at(&widgets.buffer);
+    if formats == widgets.format_toolbar_state.get() {
+        return;
+    }
+    widgets.format_toolbar_state.set(formats);
     for (button, active) in [
         (&widgets.format_bold_button, formats.bold),
         (&widgets.format_italic_button, formats.italic),
@@ -6210,6 +6308,35 @@ fn update_format_toolbar_state(widgets: &Widgets) {
             button.remove_css_class("brand-accent");
         }
     }
+}
+
+/// Defers `update_format_toolbar_state` to an idle callback - i.e. the next
+/// point the main loop is otherwise free - rather than running it inline.
+///
+/// `cursor-position` is a GObject property notify, and GObject property
+/// notifications are always synchronous: connecting this handler directly
+/// to `connect_cursor_position_notify` would run it nested inside whatever
+/// call moved the cursor, which very much includes `GtkTextBuffer::delete`/
+/// `insert` while `apply_format_to_buffer` is still on the stack for a
+/// formatting action. Mutating unrelated widgets (the toolbar buttons' CSS
+/// classes, which can trigger their own style/layout invalidation) from
+/// that deeply re-entrant a point risks exactly the kind of "widget touched
+/// mid-relayout" bug this project's RefCell-reentrancy discipline exists to
+/// prevent, just at the GTK-widget-tree level instead of the Rust-borrow
+/// level. Deferring to idle guarantees the update always runs as its own
+/// clean top-level main loop turn, after the triggering call has fully
+/// returned and any layout that call queued has had a chance to settle.
+fn schedule_format_toolbar_update(widgets: &Widgets) {
+    if let Some(source) = widgets.format_toolbar_update_source.borrow_mut().take() {
+        source.remove();
+    }
+    let widgets_for_update = widgets.clone();
+    let source_slot = widgets.format_toolbar_update_source.clone();
+    let source = glib::idle_add_local_once(move || {
+        source_slot.borrow_mut().take();
+        update_format_toolbar_state(&widgets_for_update);
+    });
+    *widgets.format_toolbar_update_source.borrow_mut() = Some(source);
 }
 
 fn show_welcome_error(widgets: &Widgets, message: &str) {

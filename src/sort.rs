@@ -34,13 +34,9 @@ pub fn sort_notes(notes: &mut [NoteSummary], order: Option<SortOrder>) {
                 .then_with(|| left.id.cmp(&right.id))
         }),
         Some(SortOrder::DateCreated) => notes.sort_by(|left, right| {
-            // `NoteSummary` does not carry `created_at` (only `Note`'s full
-            // metadata does); until it does, date-created sort falls back to
-            // updated_at, still with the UUID tie-breaker. Tracked as a
-            // follow-up rather than blocking the rest of sorting.
             right
-                .updated_at
-                .cmp(&left.updated_at)
+                .created_at
+                .cmp(&left.created_at)
                 .then_with(|| left.id.cmp(&right.id))
         }),
         Some(SortOrder::TitleAsc) => notes.sort_by(|left, right| {
@@ -69,9 +65,20 @@ mod tests {
     use super::*;
 
     fn summary(title: &str, updated_at_seconds: i64, pinned: bool) -> NoteSummary {
+        summary_with_created(title, updated_at_seconds, updated_at_seconds, pinned)
+    }
+
+    fn summary_with_created(
+        title: &str,
+        created_at_seconds: i64,
+        updated_at_seconds: i64,
+        pinned: bool,
+    ) -> NoteSummary {
         NoteSummary {
             id: Uuid::new_v4(),
             title: title.into(),
+            created_at: DateTime::<Utc>::from_timestamp(created_at_seconds, 0)
+                .expect("valid timestamp"),
             updated_at: DateTime::<Utc>::from_timestamp(updated_at_seconds, 0)
                 .expect("valid timestamp"),
             relative_path: PathBuf::from("Inbox/note.md"),
@@ -151,6 +158,27 @@ mod tests {
             first.iter().map(|note| note.id).collect::<Vec<_>>(),
             second.iter().map(|note| note.id).collect::<Vec<_>>(),
             "sorting the same input twice must always produce the same order"
+        );
+    }
+
+    #[test]
+    fn date_created_sorts_by_created_at_not_updated_at() {
+        // "Old" was created first but edited most recently; "New" was
+        // created most recently but never edited again. A DateCreated sort
+        // must order by creation time, the opposite of what a LastEdited
+        // sort (or the old created_at-less fallback) would produce.
+        let mut notes = vec![
+            summary_with_created("Old", 100, 900, false),
+            summary_with_created("New", 500, 500, false),
+        ];
+        sort_notes(&mut notes, Some(SortOrder::DateCreated));
+        assert_eq!(
+            notes
+                .iter()
+                .map(|note| note.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["New", "Old"],
+            "DateCreated must sort by created_at (New=500 before Old=100), not updated_at"
         );
     }
 }

@@ -56,6 +56,10 @@ All notable changes to SenatorialNotes will be documented here. The format follo
 
 #### Changed
 
+- The reserved default notebook now displays as "Unfiled" in the sidebar,
+  Note Information panel, and Move to Notebook dialog. Its on-disk directory
+  stays named `Inbox` for backward compatibility with existing vaults - this
+  is a display-only rename, not a data migration.
 - New Note creates in the currently selected notebook, falling back to
   `Inbox` from any smart view.
 - A locked encrypted note's protected fields (pinned, archived) are never
@@ -78,6 +82,13 @@ All notable changes to SenatorialNotes will be documented here. The format follo
 
 ### Fixed
 
+- A second real-machine acceptance pass found several remaining defects, now fixed:
+  - `Ctrl+B` no longer applies italic alongside bold. GtkSourceView's own built-in Markdown syntax highlighting (independent of, and layered underneath, Editor V2's own tags) is now disabled on the editor buffer (`set_highlight_syntax(false)`), making Editor V2's `markdown_spans`-driven tags the single, deliberate source of Markdown visual styling instead of two systems able to apply overlapping Pango attributes to the same text. Fenced code block detection/styling was added to `markdown_spans` so this does not regress the code-block highlighting the built-in highlighter used to provide.
+  - Eliminated a fatal `Gtk-WARNING: Trying to snapshot GtkGizmo ... without a current allocation` reachable by rapidly triggering formatting controls/shortcuts. The formatting toolbar's active-state update was connected directly to the text buffer's `cursor-position` notification, which GObject fires synchronously and reentrantly - so it could run nested inside the very `GtkTextBuffer::insert`/`delete` call still on the stack from applying a format, mutating other widgets' CSS classes from that reentrant point. The update is now deferred to `glib::idle_add_local_once`, always running as a clean top-level main-loop turn after the triggering call returns; it also now skips redundant work when the active formats have not actually changed.
+  - Title A-Z/Z-A sorting works correctly (this was previously verified against a real seeded vault and could not be reproduced as broken); `SortOrder::DateCreated` now sorts by each note's actual `created_at` instead of silently falling back to `updated_at`, since `NoteSummary` previously had no `created_at` field to sort by.
+  - An unlocked encrypted note's sidebar row now shows its real title/preview/tags instead of staying on the locked placeholder while it is open - `update_active_summary` no longer gates the sync behind `!encrypted`, since `state.notes` is purely in-memory and never persisted, so mirroring a currently-decrypted note's real fields there while it is unlocked leaks nothing to disk. Locking the note (manually, on a timer, or at restart) still fully reverts its summary to the anonymous locked placeholder.
+  - Multiple locked notes in the same vault are now distinguishable: each locked note's label is "Locked Note · XXXXXXXX", where the suffix is a deterministic 8-character identifier derived only from the note's own UUID (the same identifier already exposed as its on-disk filename), never from its title, body, tags, or any other protected field.
+  - Switching to a view (including Inbox) no longer launches a password prompt on its own. Automatic fallback selection - landing on whatever note sorts first when a view is opened, or on an adjacent note after one is removed - now selects a locked note without prompting for its password; a password dialog only appears when the user directly acts on that specific note (clicking its row, next/previous note, or its "Unlock Note" button).
 - The password dialog no longer aborts the process after a valid password is entered. Confirm/Cancel/Escape now take the pending completion out of its `RefCell` and drop the borrow *before* calling `window.close()`, which synchronously re-emits `close-request` into the same cell. Audited across Encrypt Note, Unlock, Change Password, and Remove Encryption; verified with real GTK interaction on Arch/Hyprland under `G_DEBUG=fatal-warnings`.
 - The Markdown formatting toolbar now toggles instead of stacking markers: Bold/Italic/Strikethrough/Highlight/Inline code remove their pair when the selection (or the span the cursor is in) already carries it, bold and italic are told apart by `*` run parity so toggling one never rewrites the other, and Style → Heading normalises any existing heading prefix and toggles back to a paragraph on a second press rather than prepending another `# `.
 - Search now matches plaintext note body text and tags, not just the title, for All Notes and Inbox. It runs entirely against the in-memory summaries with no network access and no persistent plaintext index; locked encrypted notes never populate a searchable body or tag, so their contents cannot match.
