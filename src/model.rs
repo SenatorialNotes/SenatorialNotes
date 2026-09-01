@@ -184,6 +184,15 @@ pub struct NoteSummary {
     /// SenatorialNotes never guesses or leaks it while locked. See
     /// [`NoteSummary::locked`].
     pub archived: bool,
+    /// Whether SenatorialNotes currently lacks plaintext for this note - true
+    /// only for a locked encrypted note (from [`NoteSummary::locked`]), never
+    /// for a plaintext note or a currently-unlocked encrypted one. Distinct
+    /// from `encrypted`, which only says the note *is* a `.snote` file and
+    /// stays true whether it is locked or unlocked. Smart views built on a
+    /// protected field (pinned, archived, recency) must check this before
+    /// trusting that field, since a locked note's copy of it is a
+    /// non-committal placeholder, not real data - see `pinned`/`archived`.
+    pub locked: bool,
 }
 
 impl From<&Note> for NoteSummary {
@@ -205,6 +214,7 @@ impl From<&Note> for NoteSummary {
             encrypted: false,
             pinned: note.metadata.pinned,
             archived: note.metadata.archived,
+            locked: false,
         }
     }
 }
@@ -229,6 +239,7 @@ impl NoteSummary {
             encrypted: true,
             pinned: false,
             archived: false,
+            locked: true,
         }
     }
 }

@@ -81,6 +81,7 @@ mod tests {
             encrypted: false,
             pinned,
             archived: false,
+            locked: false,
         }
     }
 

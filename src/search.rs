@@ -54,6 +54,7 @@ mod tests {
             encrypted: false,
             pinned: false,
             archived: false,
+            locked: false,
         }
     }
 
