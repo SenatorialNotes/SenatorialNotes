@@ -8,7 +8,9 @@
 use std::fs;
 use std::os::unix::fs::symlink;
 
+use senatorial_notes::config::SortOrder;
 use senatorial_notes::model::NoteMetadata;
+use senatorial_notes::sort::sort_notes;
 use senatorial_notes::{Error, Vault};
 use tempfile::tempdir;
 
@@ -325,4 +327,109 @@ fn tag_helpers_dedupe_case_insensitively_and_keep_first_casing() {
     assert!(metadata.remove_tag("ERRANDS"));
     assert_eq!(metadata.tags, vec!["home".to_string()]);
     assert!(!metadata.remove_tag("not-present"));
+}
+
+#[test]
+fn notebooks_tags_and_sorting_stay_responsive_at_realistic_vault_scale() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+
+    // A moderately deep, moderately wide notebook tree: 6 top-level
+    // notebooks, each with 3 children, each holding a handful of notes -
+    // 24 notebooks (25 with Inbox) and a few hundred notes total.
+    let top_level = [
+        "Personal",
+        "Work",
+        "Projects",
+        "Archive",
+        "Reference",
+        "Journal",
+    ];
+    let mut notebooks = Vec::new();
+    for top in top_level {
+        vault
+            .create_notebook(top)
+            .expect("top-level notebook should be created");
+        notebooks.push(top.to_string());
+        for child in ["A", "B", "C"] {
+            let relative = format!("{top}/{child}");
+            vault
+                .create_notebook(&relative)
+                .expect("child notebook should be created");
+            notebooks.push(relative);
+        }
+    }
+    notebooks.push("Inbox".to_string());
+
+    let tags = ["work", "urgent", "later", "idea", "reference"];
+    for (index, notebook) in notebooks.iter().cycle().take(300).enumerate() {
+        let mut note = vault
+            .create_note(&format!("Note {index}"), notebook)
+            .expect("note should be created");
+        note.metadata.add_tag(tags[index % tags.len()]);
+        note.metadata.pinned = index % 7 == 0;
+        note.metadata.archived = index % 11 == 0;
+        let stamp = vault
+            .current_stamp(&note.relative_path)
+            .expect("stamp should be readable");
+        vault
+            .save_note(&mut note, Some(&stamp))
+            .expect("note should save");
+    }
+
+    let list_start = std::time::Instant::now();
+    let listed = vault.list_notebooks().expect("notebooks should list");
+    let list_elapsed = list_start.elapsed();
+    assert_eq!(listed.len(), notebooks.len());
+    assert!(
+        list_elapsed < std::time::Duration::from_secs(2),
+        "list_notebooks took {list_elapsed:?} for {} notebooks",
+        notebooks.len()
+    );
+
+    let scan_start = std::time::Instant::now();
+    let mut notes = vault.scan_notes().expect("notes should scan");
+    let scan_elapsed = scan_start.elapsed();
+    assert_eq!(notes.len(), 300);
+    assert!(
+        scan_elapsed < std::time::Duration::from_secs(5),
+        "scan_notes took {scan_elapsed:?} for {} notes",
+        notes.len()
+    );
+
+    // Every supported sort order must complete quickly and never touch the
+    // filesystem (sorting is purely an in-memory Vec reorder) - checked via
+    // one representative note's on-disk stamp staying identical across the
+    // whole loop, and the scanned note count never changing.
+    let sample_relative_path = notes[0].relative_path.clone();
+    let stamp_before = vault
+        .current_stamp(&sample_relative_path)
+        .expect("sample note stamp should be readable");
+    for order in [
+        None,
+        Some(SortOrder::LastEdited),
+        Some(SortOrder::DateCreated),
+        Some(SortOrder::TitleAsc),
+        Some(SortOrder::TitleZa),
+    ] {
+        let sort_start = std::time::Instant::now();
+        sort_notes(&mut notes, order);
+        let sort_elapsed = sort_start.elapsed();
+        assert_eq!(notes.len(), 300);
+        assert!(
+            sort_elapsed < std::time::Duration::from_millis(200),
+            "sorting 300 notes by {order:?} took {sort_elapsed:?}"
+        );
+    }
+    let stamp_after = vault
+        .current_stamp(&sample_relative_path)
+        .expect("sample note stamp should still be readable");
+    assert_eq!(
+        stamp_before, stamp_after,
+        "sorting must never write to a note file"
+    );
+    assert_eq!(
+        vault.scan_notes().expect("notes should still scan").len(),
+        300
+    );
 }

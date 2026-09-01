@@ -281,3 +281,36 @@ fn adversarial_input_never_panics() {
         let _ = compute_spans(case);
     }
 }
+
+#[test]
+fn realistic_large_document_recomputes_quickly() {
+    // A ~250 KB realistic note (many paragraphs, ordinary formatting
+    // density - not adversarial repeat runs, which the panic sweep above
+    // already covers separately) must stay comfortably fast, since this
+    // runs on every debounced keystroke pause in the real editor.
+    let paragraph = "# Section heading\n\n\
+        This paragraph has **bold text**, *italic text*, ***both***, a \
+        **bold span with *nested italic* inside it**, some ~~struck~~ and \
+        ==highlighted== text, `inline code`, and a [link](https://example.com/page).\n\n\
+        > A block quote for good measure.\n\n\
+        - A bullet item\n\
+        - Another bullet with **bold** in it\n\
+        1. A numbered item\n\
+        2. Another numbered item\n\
+        - [ ] An open task\n\
+        - [x] A finished task\n\n\
+        ---\n\n";
+    let large_document = paragraph.repeat(600); // roughly 240 KB
+    assert!(large_document.len() > 200_000);
+
+    let start = std::time::Instant::now();
+    let spans = compute_spans(&large_document);
+    let elapsed = start.elapsed();
+
+    assert!(!spans.is_empty());
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "compute_spans on a ~250 KB realistic document took {elapsed:?}, expected well under \
+         500ms since it runs on every debounced keystroke pause in the real editor"
+    );
+}

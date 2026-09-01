@@ -65,6 +65,17 @@ All notable changes to SenatorialNotes will be documented here. The format follo
   real notebook (notebook membership is the file's location, not inside
   ciphertext). See `SECURITY.md`.
 
+#### Performance and hardening
+
+- Stress-tested notebooks/tags/sorting at a more realistic vault scale (25
+  notebooks up to two levels deep, 300 notes with mixed tags/pinned/archived
+  state): `list_notebooks`, `scan_notes`, and every `sort_notes` order all
+  complete well within budget, and sorting is confirmed to never write to a
+  note file (before/after file-stamp comparison).
+- The Markdown live-preview parser is benchmarked against a realistic ~240
+  KB document (not an adversarial one - that is covered separately) to stay
+  comfortably fast, since it runs on every debounced keystroke pause.
+
 ### Fixed
 
 - The password dialog no longer aborts the process after a valid password is entered. Confirm/Cancel/Escape now take the pending completion out of its `RefCell` and drop the borrow *before* calling `window.close()`, which synchronously re-emits `close-request` into the same cell. Audited across Encrypt Note, Unlock, Change Password, and Remove Encryption; verified with real GTK interaction on Arch/Hyprland under `G_DEBUG=fatal-warnings`.
