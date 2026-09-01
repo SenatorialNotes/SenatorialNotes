@@ -1,0 +1,27 @@
+/target/
+**/*.rs.bk
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+.fleet/
+result/
+build-dir/
+.flatpak-builder/
+repo/
+*.pkg.tar.*
+*.AppImage
+test-vaults/
+*.tmp
+*.recovery
+.env
+.env.*
+!.env.example
+
+
+# Crash dumps
+core
+core.*
+*.core

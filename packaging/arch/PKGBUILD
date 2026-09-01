@@ -1,0 +1,45 @@
+# Maintainer: SenatorialNotes contributors
+pkgname=senatorial-notes
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Private, local-only Markdown notes application'
+arch=('x86_64')
+url='https://github.com/SenatorialNotes/SenatorialNotes'
+license=('GPL-3.0-or-later')
+depends=('gtk4' 'libadwaita' 'gtksourceview5' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "SenatorialNotes-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "SenatorialNotes-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "SenatorialNotes-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --all-features
+}
+
+package() {
+  cd "SenatorialNotes-$pkgver"
+  install -Dm755 target/release/senatorial-notes \
+    "$pkgdir/usr/bin/senatorial-notes"
+  install -Dm644 data/io.github.SenatorialNotes.SenatorialNotes.desktop \
+    "$pkgdir/usr/share/applications/io.github.SenatorialNotes.SenatorialNotes.desktop"
+  install -Dm644 data/io.github.SenatorialNotes.SenatorialNotes.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/io.github.SenatorialNotes.SenatorialNotes.metainfo.xml"
+  install -Dm644 data/icons/hicolor/scalable/apps/io.github.SenatorialNotes.SenatorialNotes.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.SenatorialNotes.SenatorialNotes.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

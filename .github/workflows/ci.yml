@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgtk-4-dev libadwaita-1-dev libgtksourceview-5-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --all-features
+      - name: Release build
+        run: cargo build --release --all-features
+
+  metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install metadata validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes appstream desktop-file-utils
+      - name: Validate desktop entry
+        run: desktop-file-validate data/io.github.SenatorialNotes.SenatorialNotes.desktop
+      - name: Validate AppStream metadata
+        run: appstreamcli validate --no-net data/io.github.SenatorialNotes.SenatorialNotes.metainfo.xml
+      - name: Confirm Flatpak has no network permission
+        run: '! grep --line-number --fixed-strings -- "--share=network" packaging/flatpak/io.github.SenatorialNotes.SenatorialNotes.yml'

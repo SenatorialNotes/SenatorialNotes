@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a local-first improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What local notes workflow is difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Project constraints
+      options:
+        - label: This can work without accounts or runtime networking.
+          required: true
+        - label: Markdown can remain the authoritative format.
+          required: true

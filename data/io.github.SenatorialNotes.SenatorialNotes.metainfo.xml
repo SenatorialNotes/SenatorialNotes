@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.SenatorialNotes.SenatorialNotes</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>SenatorialNotes</name>
+  <summary>Private, local-only Markdown notes</summary>
+  <developer id="io.github.SenatorialNotes">
+    <name>SenatorialNotes contributors</name>
+  </developer>
+  <description>
+    <p>
+      SenatorialNotes is a native Linux notes application that keeps ordinary
+      Markdown files on your device. It has no accounts, cloud service,
+      telemetry, analytics, advertising, or runtime networking.
+    </p>
+    <p>
+      The current source provides local vault creation, Markdown editing,
+      atomic autosave, Trash and restore, appearance preferences, formatting,
+      and optional individually encrypted notes. More note-management features
+      are planned before 1.0.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.SenatorialNotes.SenatorialNotes.desktop</launchable>
+  <url type="homepage">https://github.com/SenatorialNotes/SenatorialNotes</url>
+  <url type="bugtracker">https://github.com/SenatorialNotes/SenatorialNotes/issues</url>
+  <content_rating type="oars-1.1" />
+  <recommends>
+    <display_length compare="ge">768</display_length>
+  </recommends>
+  <releases>
+    <release version="0.1.0" date="2026-08-25">
+      <description>
+        <p>Initial Phase 1 source release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

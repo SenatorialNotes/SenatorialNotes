@@ -1,0 +1,28 @@
+app-id: io.github.SenatorialNotes.SenatorialNotes
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: senatorial-notes
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+
+modules:
+  - name: senatorial-notes
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/senatorial-notes/cargo
+    build-commands:
+      - cargo --offline --frozen build --release
+      - install -Dm755 target/release/senatorial-notes /app/bin/senatorial-notes
+      - install -Dm644 data/io.github.SenatorialNotes.SenatorialNotes.desktop /app/share/applications/io.github.SenatorialNotes.SenatorialNotes.desktop
+      - install -Dm644 data/io.github.SenatorialNotes.SenatorialNotes.metainfo.xml /app/share/metainfo/io.github.SenatorialNotes.SenatorialNotes.metainfo.xml
+      - install -Dm644 data/icons/hicolor/scalable/apps/io.github.SenatorialNotes.SenatorialNotes.svg /app/share/icons/hicolor/scalable/apps/io.github.SenatorialNotes.SenatorialNotes.svg
+    sources:
+      - type: dir
+        path: ../..

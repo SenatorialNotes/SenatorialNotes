@@ -1,0 +1,41 @@
+name: Bug report
+description: Report reproducible SenatorialNotes behavior
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach private notes, real vaults, credentials, or recovery files.
+  - type: input
+    id: version
+    attributes:
+      label: SenatorialNotes version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Linux distribution and desktop
+      placeholder: Arch Linux, GNOME 50, Wayland
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use newly created dummy notes only.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true

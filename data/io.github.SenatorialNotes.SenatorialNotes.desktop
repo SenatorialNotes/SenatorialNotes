@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=SenatorialNotes
+Comment=Private, local-only Markdown notes
+GenericName=Notes Application
+Exec=senatorial-notes
+Icon=io.github.SenatorialNotes.SenatorialNotes
+Terminal=false
+Type=Application
+Categories=GNOME;GTK;Utility;TextEditor;
+Keywords=notes;markdown;offline;private;writing;
+DBusActivatable=true
+StartupNotify=true

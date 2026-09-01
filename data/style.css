@@ -1,0 +1,114 @@
+.senatorial-header {
+  border-bottom: 1px solid alpha(currentColor, 0.10);
+}
+
+.welcome-surface {
+  padding: 32px;
+}
+
+.senatorial-sidebar {
+  padding: 4px;
+}
+
+.sidebar-section-title {
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  opacity: 0.56;
+  margin: 4px 8px 7px 8px;
+}
+
+.sidebar-item {
+  min-height: 38px;
+  border-radius: 10px;
+  padding: 0 10px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.sidebar-selected {
+  font-weight: 700;
+}
+
+.notes-column {
+  border-left: 1px solid alpha(currentColor, 0.08);
+  border-right: 1px solid alpha(currentColor, 0.08);
+}
+
+.note-list {
+  background: transparent;
+  padding: 0 6px 12px 6px;
+}
+
+.note-list row {
+  border-radius: 12px;
+  margin: 2px 5px;
+  border: 1px solid transparent;
+}
+
+.note-list row:hover {
+  background-color: alpha(currentColor, 0.06);
+}
+
+.note-list row:selected {
+  border-color: alpha(currentColor, 0.12);
+}
+
+.note-list row:selected .heading {
+  font-weight: 750;
+}
+
+.note-card {
+  padding: 0 2px;
+}
+
+.editor-pane {
+  background-color: @view_bg_color;
+}
+
+.title-area {
+  border-bottom: 1px solid alpha(currentColor, 0.06);
+  padding-bottom: 2px;
+}
+
+.note-title {
+  font-size: 1.55em;
+  font-weight: 750;
+  min-height: 46px;
+  border: none;
+  box-shadow: none;
+  background: transparent;
+  padding: 0;
+}
+
+.note-title > text {
+  background: transparent;
+}
+
+.save-status {
+  font-size: 0.82em;
+}
+
+.formatting-bar {
+  min-height: 38px;
+  padding: 3px 0 7px 0;
+  border-bottom: 1px solid alpha(currentColor, 0.07);
+}
+
+.format-button {
+  min-width: 34px;
+  min-height: 30px;
+  font-weight: 650;
+}
+
+.editor-view {
+  padding-top: 10px;
+  caret-color: currentColor;
+}
+
+.preference-row {
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background-color: alpha(currentColor, 0.045);
+}
