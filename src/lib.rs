@@ -11,6 +11,7 @@ pub mod formatting;
 pub mod model;
 pub mod paths;
 pub mod search;
+pub mod sort;
 pub mod storage;
 pub mod ui_state;
 pub mod vault;

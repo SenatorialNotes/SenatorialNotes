@@ -594,13 +594,10 @@ impl Vault {
     pub fn scan_notes(&self) -> Result<Vec<NoteSummary>> {
         let mut notes = Vec::new();
         self.scan_directory(&self.notes_dir(), &mut notes)?;
-        notes.sort_by(|left, right| {
-            right
-                .pinned
-                .cmp(&left.pinned)
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-                .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
-        });
+        // `None` is the shared default comparator (pinned-first, then
+        // recency, then title, then UUID) - see `sort::sort_notes`. Callers
+        // that want an explicit user-chosen order re-sort afterward.
+        crate::sort::sort_notes(&mut notes, None);
         Ok(notes)
     }
 

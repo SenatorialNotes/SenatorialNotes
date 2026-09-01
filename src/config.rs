@@ -27,6 +27,27 @@ pub enum NoteListDensity {
     Spacious,
 }
 
+/// User-controlled note-list ordering.
+///
+/// `AppConfig::sort_order` is `Option<SortOrder>`, not a plain `SortOrder`,
+/// because "no preference saved yet" and "explicitly chose Last Edited" are
+/// different states: with no explicit choice (`None`), behavior stays
+/// byte-for-byte the v0.1 default (pinned-first, then most-recently-updated,
+/// then title). Choosing any variant explicitly (`Some(_)`, including
+/// `LastEdited`) makes that field the sole primary key - pinned-first is
+/// dropped, since silently regrouping by pin would contradict an explicit
+/// choice - with note UUID as the final tie-breaker so equal keys never
+/// produce a "flickering" order between renders. Sorting only ever reorders
+/// an in-memory list; it never rewrites a note file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SortOrder {
+    LastEdited,
+    DateCreated,
+    TitleAsc,
+    TitleZa,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Accent {
@@ -104,6 +125,10 @@ pub struct AppConfig {
     pub appearance: AppearanceConfig,
     #[serde(default)]
     pub encrypted_note_locking: LockingConfig,
+    /// `None` means no explicit preference has been saved yet; see
+    /// [`SortOrder`] for why that is distinct from `Some(SortOrder::LastEdited)`.
+    #[serde(default)]
+    pub sort_order: Option<SortOrder>,
 }
 
 impl Default for AppConfig {
@@ -115,6 +140,7 @@ impl Default for AppConfig {
             title_commit_delay_ms: default_title_delay(),
             appearance: AppearanceConfig::default(),
             encrypted_note_locking: LockingConfig::default(),
+            sort_order: None,
         }
     }
 }
