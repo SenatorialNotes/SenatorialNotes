@@ -146,15 +146,66 @@ Screenshots will be added after the Phase 1 application has been rendered and vi
 
 ## Roadmap
 
-- **Phase 1 — Foundation:** storage model, atomic save, basic native vault/note/editor UI. Implemented in source; native build validation pending.
-- **Phase 2 — Note management:** Trash, restore, pinning, watcher, and Preferences are implemented; tags, user-controlled sorting, indexed search, and complete conflict choices remain.
-- **Phase 3 — Editing and attachments:** formatting actions are implemented; native reading view, attachments, drag-and-drop, import/export, and local history remain.
-- **Phase 4 — Hardening:** accessibility pass, performance work, recovery testing, vault locks, release packaging.
-- **Phase 5 — Release preparation:** screenshots, complete documentation, final packaging and release checks.
+### v0.1 — Foundation and hardening
+
+- stable local Markdown notes
+- responsive native GTK interface
+- autosave and recovery
+- Trash and restore
+- local title/body/tag search
+- per-note encryption
+- crash resistance and real-machine testing
+
+### v0.2 — Organisation and editor
+
+Planned:
+
+- proper folders and notebooks
+- nested organisation
+- improved tag management
+- Archive and Recently Edited
+- stronger sorting and filtering
+- keyboard-navigation improvements
+- note information panel
+- major editor overhaul
+
+The current alpha edits Markdown directly, so formatting markers such as
+`#`, `*`, and `**` remain visible. A future editor overhaul is planned
+to provide a more polished visual editing experience.
+
+### v0.3 — Vault architecture
+
+Planned:
+
+- multiple Senatorial vaults
+- ordinary vaults
+- encrypted vaults
+- continued support for individually encrypted notes
+
+SenatorialNotes will manage information inside Senatorial vaults. It is
+not intended to become a general-purpose file manager.
+
+### Later releases — Local document management
+
+Longer-term direction includes:
+
+- attachments
+- PDFs and documents
+- document metadata
+- document versioning
+- checksums and integrity verification
+- duplicate detection
+- previews
+- local indexing
+- local-only OCR
+- encrypted document/index storage where appropriate
+
+No SenatorialNotes cloud service, account system, telemetry, or built-in
+synchronisation service is planned.
 
 ## Contributing
 
-Contributions are welcome once the future repository is published. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). By contributing, you agree that your work is licensed under GPL-3.0-or-later.
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). By contributing, you agree that your work is licensed under GPL-3.0-or-later.
 
 ## License
 
