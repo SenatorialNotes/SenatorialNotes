@@ -57,4 +57,6 @@ The serialized bytes are encrypted in full. The neutral filename is `encrypted--
 
 Every save uses a fresh nonce and atomic sibling-file replacement. Initial conversion overwrites the original Markdown path with ciphertext before renaming it to `.snote`, avoiding a second plaintext copy. Encrypted notes never use plaintext crash-recovery files and locked content is not stored in persistent search data.
 
+Because the file path is not part of the authenticated header, moving a `.snote` file between notebooks is an ordinary filesystem rename. It does not re-encrypt the container, does not require the password, and does not change the ciphertext or its authentication.
+
 The derived key is retained only in an in-process session while permitted by the user's locking settings. Key and serialization buffers use established zeroization support where practical. Locking clears the editor and drops session key material; normal application exit always drops it.

@@ -1,6 +1,6 @@
 # Arch package
 
-`PKGBUILD` is prepared for the future `v0.1.0` source tag at `SenatorialNotes/SenatorialNotes`. Because no remote or tag exists yet, it cannot download that source today.
+`PKGBUILD` is prepared for the future `v0.2.0-alpha` source tag at `SenatorialNotes/SenatorialNotes`. Because no remote or tag exists yet, it cannot download that source today. (`pkgver` is `0.2.0_alpha` because Arch package versions cannot contain a hyphen; `$_tag` and `$_srcver` carry the real tag and archive directory name.)
 
 After the repository and tag exist, update `sha256sums` with the release archive's real checksum, then build in a clean Arch environment:
 

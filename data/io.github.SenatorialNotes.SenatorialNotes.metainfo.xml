@@ -5,7 +5,7 @@
   <project_license>GPL-3.0-or-later</project_license>
   <name>SenatorialNotes</name>
   <summary>Private, local-only Markdown notes</summary>
-  <developer id="io.github.SenatorialNotes">
+  <developer id="io.github.senatorialnotes">
     <name>SenatorialNotes contributors</name>
   </developer>
   <description>
@@ -15,10 +15,17 @@
       telemetry, analytics, advertising, or runtime networking.
     </p>
     <p>
-      The current source provides local vault creation, Markdown editing,
-      atomic autosave, Trash and restore, appearance preferences, formatting,
-      and optional individually encrypted notes. More note-management features
-      are planned before 1.0.
+      It provides local vault creation, a Markdown editor with live visual
+      styling, atomic autosave, Trash and restore, nested notebooks, tags and
+      tag filtering, Archive, Pinned and Recently Edited views, user-controlled
+      sorting, a Note Information panel, appearance preferences, and optional
+      individually encrypted notes. More note-management features are planned
+      before 1.0.
+    </p>
+    <p>
+      The editor styles Markdown visually while keeping Markdown as the format
+      on disk. Syntax markers stay visible but subdued rather than hidden; it is
+      not a full WYSIWYG editor.
     </p>
   </description>
   <launchable type="desktop-id">io.github.SenatorialNotes.SenatorialNotes.desktop</launchable>
@@ -29,6 +36,20 @@
     <display_length compare="ge">768</display_length>
   </recommends>
   <releases>
+    <release version="0.2.0-alpha" date="2026-09-01">
+      <description>
+        <p>Organisation and editor release.</p>
+        <ul>
+          <li>Nested notebooks with safe create, rename, and delete.</li>
+          <li>Note movement between notebooks, including encrypted notes.</li>
+          <li>Tags and tag filtering, Archive, Pinned and Recently Edited views.</li>
+          <li>User-controlled sorting and composed notebook, tag, and search filtering.</li>
+          <li>A Note Information panel and keyboard-navigation improvements.</li>
+          <li>Editor V2 live visual Markdown styling; markers stay visible but subdued.</li>
+          <li>Encrypted-note privacy and stability fixes.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-08-25">
       <description>
         <p>Initial Phase 1 source release.</p>

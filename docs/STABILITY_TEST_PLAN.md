@@ -17,7 +17,7 @@ cargo build --release
 2. Click **New Note** 100 times. Confirm that the title field remains focused and the application remains responsive.
 3. Alternate rapidly between the first and second notes with the pointer, then with keyboard navigation.
 4. Edit a title and body while watching the cursor, selection, focus, and scroll position through several autosaves.
-5. Switch repeatedly among **All Notes**, **Inbox**, and **Trash**.
+5. Switch repeatedly among **All Notes**, **Unfiled**, and **Trash**.
 6. Right-click several different notes without first selecting them. Close and reopen each menu.
 7. From context menus, rename, pin, unpin, and move both selected and non-selected notes to Trash.
 8. In Trash, restore selected and non-selected notes, then permanently delete a disposable note after confirming the dialog.
