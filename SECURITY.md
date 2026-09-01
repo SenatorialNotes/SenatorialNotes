@@ -42,3 +42,9 @@ SenatorialNotes does not invent cryptographic primitives. Version 1 encrypted-no
 Passwords, reversible passwords, plaintext keys, recovery questions, master recovery keys, and backdoors are never stored. Derived keys exist only in process memory while a note is unlocked and are zeroized when their session object is dropped. Sensitive serialization buffers are also zeroized. Rust/GTK strings and operating-system memory can still leave transient copies; locking is not a defense against a compromised running computer.
 
 There is no password recovery. Security depends on password strength, correct cryptographic implementation, and the integrity of the computer while the note is unlocked. Full-disk encryption is still recommended because it additionally protects ordinary notes, swap, hibernation, caches, filenames outside encrypted containers, and other application data.
+
+## Locked encrypted notes and organisational views
+
+Pinned state, Archive state, and tags for an encrypted note live inside its authenticated ciphertext, exactly like its title and body. SenatorialNotes never stores a plaintext copy of these fields to make organisational views work while a note is locked, and it never guesses.
+
+Practically, this means a locked encrypted note's pinned/archived state reads as "not set" until it is unlocked: it stays visible in All Notes and its real notebook (the file's location on disk is not protected metadata), but it never appears in the Pinned, Archive, or Recently Edited smart views - even if it truly is pinned, archived, or recently edited - because SenatorialNotes cannot truthfully make that claim without the password. Unlocking the note restores its correct place in every view immediately; locking it again reverts to the same non-committal state, with no residual value left in memory.

@@ -4,6 +4,38 @@ All notable changes to SenatorialNotes will be documented here. The format follo
 
 ## [Unreleased]
 
+### v0.2 (in progress — not yet accepted; real-machine acceptance pending)
+
+#### Added
+
+- Real, user-facing notebooks: create, rename, and safely delete (refuses on
+  any note or any file/symlink it does not manage anywhere in the subtree;
+  never a recursive `remove_dir_all`), with nested child notebooks. `Inbox`
+  is a reserved notebook and cannot be renamed or deleted.
+- Moving a note between notebooks, including encrypted `.snote` notes - the
+  encrypted container's authenticated header never includes the file path,
+  so a move is a plain, collision-safe (`renameat2`/`RENAME_NOREPLACE`)
+  filesystem rename, never a re-encryption.
+- Archive, with an Archive smart view; Pinned and Recently Edited as
+  first-class smart views alongside All Notes/Inbox/Trash.
+- Tag add/remove in the editor, and a sidebar tag-filter section, with
+  case-insensitive duplicate prevention that preserves first-seen casing.
+- User-controlled sort order (Last Edited, Date Created, Title A-Z, Title
+  Z-A) alongside the existing default (pinned-first, then recency, then
+  title); explicit choices never rewrite note files.
+- Combined notebook + tag + search filtering.
+
+#### Changed
+
+- New Note creates in the currently selected notebook, falling back to
+  `Inbox` from any smart view.
+- A locked encrypted note's protected fields (pinned, archived) are never
+  guessed or leaked while locked: they read as `false` until the note is
+  unlocked, which keeps it out of Pinned/Archive/Recently Edited (all built
+  from protected fields) while it stays fully visible in All Notes and its
+  real notebook (notebook membership is the file's location, not inside
+  ciphertext). See `SECURITY.md`.
+
 ### Fixed
 
 - The password dialog no longer aborts the process after a valid password is entered. Confirm/Cancel/Escape now take the pending completion out of its `RefCell` and drop the borrow *before* calling `window.close()`, which synchronously re-emits `close-request` into the same cell. Audited across Encrypt Note, Unlock, Change Password, and Remove Encryption; verified with real GTK interaction on Arch/Hyprland under `G_DEBUG=fatal-warnings`.
