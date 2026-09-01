@@ -73,9 +73,9 @@ fn selection_delete_restore_view_switch_and_context_targets_stay_consistent() {
     flow.note_restored(second);
     coordinator.remove_row(RowTarget::Trash(second));
     assert_eq!(flow.selected_trash(), None);
-    flow.switch_view(ViewMode::Notes);
+    flow.switch_view(ViewMode::AllNotes);
     coordinator.replace_rows(vec![RowTarget::Note(first), RowTarget::Note(second)]);
-    assert_eq!(flow.view(), ViewMode::Notes);
+    assert_eq!(flow.view(), &ViewMode::AllNotes);
 }
 
 #[test]

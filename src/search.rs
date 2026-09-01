@@ -46,6 +46,7 @@ mod tests {
         NoteSummary {
             id: Uuid::new_v4(),
             title: title.into(),
+            created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
             updated_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
             relative_path: PathBuf::from("Inbox/note.md"),
             preview: String::new(),
@@ -53,6 +54,8 @@ mod tests {
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             encrypted: false,
             pinned: false,
+            archived: false,
+            locked: false,
         }
     }
 

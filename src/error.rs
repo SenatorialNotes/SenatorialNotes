@@ -47,6 +47,22 @@ pub enum Error {
 
     #[error("the requested operation is not valid for this note type")]
     WrongNoteType,
+
+    #[error(
+        "notebook {relative_path} is not empty ({note_count} note(s) inside); move, archive, or delete its notes first"
+    )]
+    NotebookNotEmpty {
+        relative_path: PathBuf,
+        note_count: usize,
+    },
+
+    #[error(
+        "notebook {relative_path} contains files SenatorialNotes does not manage; it will not delete them"
+    )]
+    NotebookHasUnmanagedContent { relative_path: PathBuf },
+
+    #[error("{relative_path} is a reserved notebook and cannot be renamed or deleted")]
+    ReservedNotebook { relative_path: PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

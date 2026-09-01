@@ -68,3 +68,57 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     }
     result
 }
+
+/// Renames `from` to `to`, refusing atomically if `to` already exists instead
+/// of silently overwriting it the way plain `fs::rename` would.
+///
+/// Uses the Linux `renameat2(RENAME_NOREPLACE)` syscall (this application
+/// targets Linux only), which makes the existence check and the rename a
+/// single atomic kernel operation - immune to a collision that appears
+/// between a separate check and a separate rename. Falls back to a
+/// check-then-rename on a kernel/filesystem that doesn't support the flag
+/// (`ENOSYS`/`EINVAL`), matching the convention used elsewhere in this
+/// module.
+pub fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = renameat2_no_replace(from, to) {
+        return result;
+    }
+
+    if to.exists() {
+        return Err(crate::Error::AlreadyExists(to.to_path_buf()));
+    }
+    fs::rename(from, to).map_err(|source| io_error(to, source))
+}
+
+/// Returns `None` when `renameat2`/`RENAME_NOREPLACE` is unavailable on this
+/// kernel/filesystem, so the caller can fall back to check-then-rename.
+#[cfg(target_os = "linux")]
+fn renameat2_no_replace(from: &Path, to: &Path) -> Option<Result<()>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from_c = CString::new(from.as_os_str().as_bytes()).ok()?;
+    let to_c = CString::new(to.as_os_str().as_bytes()).ok()?;
+
+    let outcome = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if outcome == 0 {
+        return Some(Ok(()));
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::EEXIST => {
+            Some(Err(crate::Error::AlreadyExists(to.to_path_buf())))
+        }
+        Some(code) if code == libc::ENOSYS || code == libc::EINVAL => None,
+        _ => Some(Err(io_error(to, error))),
+    }
+}

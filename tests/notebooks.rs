@@ -1,0 +1,435 @@
+//! Storage-layer regression coverage for v0.2 notebook and tag operations:
+//! create/rename/delete safety, nested notebooks, note moves (including
+//! encrypted notes, where a move must never require re-encryption), and tag
+//! normalization. UI-layer runtime-state behavior (active note, caches,
+//! selection, watcher baseline) is covered separately once the UI wiring
+//! exists.
+
+use std::fs;
+use std::os::unix::fs::symlink;
+
+use senatorial_notes::config::SortOrder;
+use senatorial_notes::model::NoteMetadata;
+use senatorial_notes::sort::sort_notes;
+use senatorial_notes::{Error, Vault};
+use tempfile::tempdir;
+
+#[test]
+fn list_notebooks_reports_nested_notebooks_with_direct_counts() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    vault
+        .create_notebook("Work/Projects")
+        .expect("nested notebook should be created");
+    vault
+        .create_note("Top level", "Work")
+        .expect("note should be created");
+    vault
+        .create_note("Nested", "Work/Projects")
+        .expect("note should be created");
+
+    let notebooks = vault.list_notebooks().expect("notebooks should list");
+    let inbox = notebooks
+        .iter()
+        .find(|entry| entry.relative_path == std::path::Path::new("Inbox"))
+        .expect("Inbox is always present");
+    assert_eq!(inbox.direct_note_count, 0);
+    let work = notebooks
+        .iter()
+        .find(|entry| entry.relative_path == std::path::Path::new("Work"))
+        .expect("Work notebook should be listed");
+    assert_eq!(work.direct_note_count, 1, "direct count excludes children");
+    let projects = notebooks
+        .iter()
+        .find(|entry| entry.relative_path == std::path::Path::new("Work/Projects"))
+        .expect("nested notebook should be listed");
+    assert_eq!(projects.direct_note_count, 1);
+}
+
+#[test]
+fn inbox_cannot_be_renamed_or_deleted() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+
+    let rename_error = vault
+        .rename_notebook(std::path::Path::new("Inbox"), "Renamed")
+        .expect_err("Inbox rename must be refused");
+    assert!(matches!(rename_error, Error::ReservedNotebook { .. }));
+
+    let delete_error = vault
+        .delete_notebook(std::path::Path::new("Inbox"))
+        .expect_err("Inbox delete must be refused");
+    assert!(matches!(delete_error, Error::ReservedNotebook { .. }));
+
+    // A nested notebook under Inbox is not reserved.
+    vault
+        .create_notebook("Inbox/Drafts")
+        .expect("nested notebook under Inbox should be created");
+    vault
+        .rename_notebook(std::path::Path::new("Inbox/Drafts"), "Scratch")
+        .expect("non-reserved nested notebook should rename");
+}
+
+#[test]
+fn renaming_a_notebook_refuses_a_colliding_sibling_name() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    vault
+        .create_notebook("Personal")
+        .expect("notebook should be created");
+    vault
+        .create_notebook("Work")
+        .expect("notebook should be created");
+
+    let error = vault
+        .rename_notebook(std::path::Path::new("Personal"), "Work")
+        .expect_err("colliding rename must be refused");
+    assert!(matches!(error, Error::AlreadyExists(_)));
+}
+
+#[test]
+fn empty_notebook_deletes_successfully_including_empty_nested_subtree() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    vault
+        .create_notebook("Archive/Old/Empty")
+        .expect("nested notebook should be created");
+
+    vault
+        .delete_notebook(std::path::Path::new("Archive"))
+        .expect("empty nested notebook subtree should delete");
+    assert!(!vault.notes_dir().join("Archive").exists());
+}
+
+#[test]
+fn non_empty_notebook_refuses_deletion_and_names_the_note_count() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    vault
+        .create_notebook("Work/Projects")
+        .expect("notebook should be created");
+    vault
+        .create_note("Deep note", "Work/Projects")
+        .expect("note should be created");
+
+    let error = vault
+        .delete_notebook(std::path::Path::new("Work"))
+        .expect_err("non-empty notebook must refuse deletion");
+    match error {
+        Error::NotebookNotEmpty {
+            relative_path,
+            note_count,
+        } => {
+            assert_eq!(relative_path, std::path::Path::new("Work"));
+            assert_eq!(note_count, 1);
+        }
+        other => panic!("expected NotebookNotEmpty, got {other:?}"),
+    }
+    assert!(
+        vault.notes_dir().join("Work/Projects").exists(),
+        "nothing must be deleted when the operation is refused"
+    );
+}
+
+#[test]
+fn notebook_with_an_unmanaged_file_refuses_deletion_without_touching_it() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    vault
+        .create_notebook("Archive")
+        .expect("notebook should be created");
+    let stray = vault.notes_dir().join("Archive/notes.bak");
+    fs::write(&stray, b"not managed by SenatorialNotes").expect("fixture file should write");
+
+    let error = vault
+        .delete_notebook(std::path::Path::new("Archive"))
+        .expect_err("a notebook with unrecognised content must refuse deletion");
+    assert!(matches!(error, Error::NotebookHasUnmanagedContent { .. }));
+    assert!(stray.exists(), "the unmanaged file must never be touched");
+}
+
+#[test]
+fn notebook_with_a_symlink_refuses_deletion_without_touching_it() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    vault
+        .create_notebook("Archive")
+        .expect("notebook should be created");
+    let target = temporary.path().join("outside.txt");
+    fs::write(&target, b"outside the vault").expect("fixture file should write");
+    let link = vault.notes_dir().join("Archive/link.txt");
+    symlink(&target, &link).expect("fixture symlink should be created");
+
+    let error = vault
+        .delete_notebook(std::path::Path::new("Archive"))
+        .expect_err("a notebook containing a symlink must refuse deletion");
+    assert!(matches!(error, Error::NotebookHasUnmanagedContent { .. }));
+    assert!(link.exists(), "the symlink must never be touched");
+    assert!(target.exists(), "the symlink target must never be touched");
+}
+
+#[test]
+fn moving_a_plaintext_note_preserves_uuid_body_and_updated_at() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    vault
+        .create_notebook("Work")
+        .expect("notebook should be created");
+    let created = vault
+        .create_note("Moving day", "Inbox")
+        .expect("note should be created");
+    let (mut note, stamp) = vault
+        .load_note(&created.relative_path)
+        .expect("note should load");
+    note.body = "content that must survive the move".into();
+    vault
+        .save_note(&mut note, Some(&stamp))
+        .expect("note should save");
+    let before_move = vault
+        .load_note(&created.relative_path)
+        .expect("note should reload")
+        .0;
+
+    let next_relative = vault
+        .move_note(&created.relative_path, "Work")
+        .expect("move should succeed");
+    assert_eq!(
+        next_relative,
+        std::path::Path::new("Work").join(
+            created
+                .relative_path
+                .file_name()
+                .expect("filename should exist"),
+        )
+    );
+    assert!(!vault.note_path(&created.relative_path).unwrap().exists());
+
+    let (moved, _stamp) = vault.load_note(&next_relative).expect("moved note loads");
+    assert_eq!(moved.metadata.id, before_move.metadata.id);
+    assert_eq!(moved.body, before_move.body);
+    assert_eq!(moved.metadata.updated_at, before_move.metadata.updated_at);
+}
+
+#[test]
+fn moving_a_note_into_a_notebook_that_does_not_exist_yet_creates_it() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    let created = vault
+        .create_note("New destination", "Inbox")
+        .expect("note should be created");
+
+    let next_relative = vault
+        .move_note(&created.relative_path, "Personal/Finance")
+        .expect("move should create the destination notebook");
+    assert!(vault.notes_dir().join("Personal/Finance").is_dir());
+    assert!(vault.note_path(&next_relative).unwrap().is_file());
+}
+
+#[test]
+fn moving_a_note_onto_a_colliding_destination_filename_refuses_without_overwriting() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    vault
+        .create_notebook("Work")
+        .expect("notebook should be created");
+    let moving = vault
+        .create_note("Duplicate title", "Inbox")
+        .expect("note should be created");
+    // Fabricate a real filename collision at the destination: same title
+    // slug and the *moving* note's own short UUID, exactly the filename
+    // `move_note` will compute as its destination.
+    let destination_name = moving
+        .relative_path
+        .file_name()
+        .expect("filename should exist")
+        .to_owned();
+    let colliding_path = vault.notes_dir().join("Work").join(&destination_name);
+    fs::write(&colliding_path, b"pre-existing file at the destination")
+        .expect("fixture file should write");
+
+    let error = vault
+        .move_note(&moving.relative_path, "Work")
+        .expect_err("a real destination collision must be refused");
+    assert!(matches!(error, Error::AlreadyExists(_)));
+    assert_eq!(
+        fs::read_to_string(&colliding_path).expect("destination should be unchanged"),
+        "pre-existing file at the destination",
+        "the existing file at the destination must never be silently overwritten"
+    );
+    assert!(
+        vault.note_path(&moving.relative_path).unwrap().exists(),
+        "the note being moved must remain at its original location on refusal"
+    );
+}
+
+#[test]
+fn moving_a_note_to_its_current_notebook_is_a_harmless_no_op() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    let created = vault
+        .create_note("Already home", "Inbox")
+        .expect("note should be created");
+
+    let next_relative = vault
+        .move_note(&created.relative_path, "Inbox")
+        .expect("moving into the same notebook should succeed as a no-op");
+    assert_eq!(next_relative, created.relative_path);
+}
+
+#[test]
+fn moving_an_encrypted_note_preserves_decryption_under_the_same_password() {
+    // This is the empirical proof for the architecture finding that the
+    // `.snote` container's authenticated header does not include the file
+    // path: a plain filesystem move must not require re-encryption, and the
+    // moved file must still decrypt correctly with the original password.
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+    vault
+        .create_notebook("Personal")
+        .expect("notebook should be created");
+    let mut note = vault
+        .create_note("Secret plan", "Inbox")
+        .expect("note should be created");
+    note.body = "the launch codes are hidden here".into();
+    let password = "correct horse battery staple";
+    let (_stamp, _session) = vault
+        .encrypt_note(&mut note, None, password)
+        .expect("note should encrypt");
+    let encrypted_relative = note.relative_path.clone();
+
+    let next_relative = vault
+        .move_note(&encrypted_relative, "Personal")
+        .expect("encrypted note should move like any other file");
+    assert_ne!(next_relative, encrypted_relative);
+
+    let (decrypted, _stamp, _session) = vault
+        .load_encrypted_note(&next_relative, password)
+        .expect("moved encrypted note should still decrypt with the same password");
+    assert_eq!(decrypted.metadata.id, note.metadata.id);
+    assert_eq!(decrypted.body, "the launch codes are hidden here");
+}
+
+#[test]
+fn tag_helpers_dedupe_case_insensitively_and_keep_first_casing() {
+    let mut metadata = NoteMetadata::new("Note with tags");
+    assert!(metadata.add_tag("Errands"));
+    assert!(!metadata.add_tag("errands"), "case-insensitive duplicate");
+    assert!(!metadata.add_tag("ERRANDS"), "case-insensitive duplicate");
+    assert!(!metadata.add_tag("  "), "whitespace-only tag is rejected");
+    assert_eq!(metadata.tags, vec!["Errands".to_string()]);
+
+    assert!(metadata.add_tag("home"));
+    assert_eq!(
+        metadata.tags,
+        vec!["Errands".to_string(), "home".to_string()]
+    );
+
+    assert!(metadata.remove_tag("ERRANDS"));
+    assert_eq!(metadata.tags, vec!["home".to_string()]);
+    assert!(!metadata.remove_tag("not-present"));
+}
+
+#[test]
+fn notebooks_tags_and_sorting_stay_responsive_at_realistic_vault_scale() {
+    let temporary = tempdir().expect("temporary directory");
+    let vault = Vault::create(temporary.path().join("Vault")).expect("vault should be created");
+
+    // A moderately deep, moderately wide notebook tree: 6 top-level
+    // notebooks, each with 3 children, each holding a handful of notes -
+    // 24 notebooks (25 with Inbox) and a few hundred notes total.
+    let top_level = [
+        "Personal",
+        "Work",
+        "Projects",
+        "Archive",
+        "Reference",
+        "Journal",
+    ];
+    let mut notebooks = Vec::new();
+    for top in top_level {
+        vault
+            .create_notebook(top)
+            .expect("top-level notebook should be created");
+        notebooks.push(top.to_string());
+        for child in ["A", "B", "C"] {
+            let relative = format!("{top}/{child}");
+            vault
+                .create_notebook(&relative)
+                .expect("child notebook should be created");
+            notebooks.push(relative);
+        }
+    }
+    notebooks.push("Inbox".to_string());
+
+    let tags = ["work", "urgent", "later", "idea", "reference"];
+    for (index, notebook) in notebooks.iter().cycle().take(300).enumerate() {
+        let mut note = vault
+            .create_note(&format!("Note {index}"), notebook)
+            .expect("note should be created");
+        note.metadata.add_tag(tags[index % tags.len()]);
+        note.metadata.pinned = index % 7 == 0;
+        note.metadata.archived = index % 11 == 0;
+        let stamp = vault
+            .current_stamp(&note.relative_path)
+            .expect("stamp should be readable");
+        vault
+            .save_note(&mut note, Some(&stamp))
+            .expect("note should save");
+    }
+
+    let list_start = std::time::Instant::now();
+    let listed = vault.list_notebooks().expect("notebooks should list");
+    let list_elapsed = list_start.elapsed();
+    assert_eq!(listed.len(), notebooks.len());
+    assert!(
+        list_elapsed < std::time::Duration::from_secs(2),
+        "list_notebooks took {list_elapsed:?} for {} notebooks",
+        notebooks.len()
+    );
+
+    let scan_start = std::time::Instant::now();
+    let mut notes = vault.scan_notes().expect("notes should scan");
+    let scan_elapsed = scan_start.elapsed();
+    assert_eq!(notes.len(), 300);
+    assert!(
+        scan_elapsed < std::time::Duration::from_secs(5),
+        "scan_notes took {scan_elapsed:?} for {} notes",
+        notes.len()
+    );
+
+    // Every supported sort order must complete quickly and never touch the
+    // filesystem (sorting is purely an in-memory Vec reorder) - checked via
+    // one representative note's on-disk stamp staying identical across the
+    // whole loop, and the scanned note count never changing.
+    let sample_relative_path = notes[0].relative_path.clone();
+    let stamp_before = vault
+        .current_stamp(&sample_relative_path)
+        .expect("sample note stamp should be readable");
+    for order in [
+        None,
+        Some(SortOrder::LastEdited),
+        Some(SortOrder::DateCreated),
+        Some(SortOrder::TitleAsc),
+        Some(SortOrder::TitleZa),
+    ] {
+        let sort_start = std::time::Instant::now();
+        sort_notes(&mut notes, order);
+        let sort_elapsed = sort_start.elapsed();
+        assert_eq!(notes.len(), 300);
+        assert!(
+            sort_elapsed < std::time::Duration::from_millis(200),
+            "sorting 300 notes by {order:?} took {sort_elapsed:?}"
+        );
+    }
+    let stamp_after = vault
+        .current_stamp(&sample_relative_path)
+        .expect("sample note stamp should still be readable");
+    assert_eq!(
+        stamp_before, stamp_after,
+        "sorting must never write to a note file"
+    );
+    assert_eq!(
+        vault.scan_notes().expect("notes should still scan").len(),
+        300
+    );
+}

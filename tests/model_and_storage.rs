@@ -466,7 +466,8 @@ fn locked_encrypted_notes_do_not_leak_into_summaries_recovery_or_indexes() {
     let summaries = vault.scan_notes().expect("scan notes");
     assert_eq!(summaries.len(), 1);
     assert!(summaries[0].encrypted);
-    assert_eq!(summaries[0].title, "Locked Note");
+    assert!(summaries[0].title.starts_with("Locked Note"));
+    assert!(!summaries[0].title.contains("INDEX-SECRET-TITLE"));
     assert!(!summaries[0].preview.contains("INDEX-SECRET"));
     assert!(matches!(
         vault.write_recovery(&note),

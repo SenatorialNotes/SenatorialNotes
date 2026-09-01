@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -9,15 +9,20 @@ use adw::{Application, ApplicationWindow};
 use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
-use senatorial_notes::config::{Accent, AppConfig, NoteListDensity, Theme};
+use gtk::glib::variant::ToVariant;
+use senatorial_notes::config::{Accent, AppConfig, NoteListDensity, SortOrder, Theme};
 use senatorial_notes::constants::{APP_ID, APP_NAME, MIN_PASSWORD_LENGTH, PRIVACY_STATEMENT};
 use senatorial_notes::formatting::{FormatAction, apply_markdown_format};
+use senatorial_notes::markdown_spans::{self, SpanKind};
 use senatorial_notes::search::summary_matches;
+use senatorial_notes::sort::sort_notes;
 use senatorial_notes::ui_state::{
-    RowTarget, SelectionCoordinator, SelectionIntent, UiFlow, ViewMode,
+    FilterState, RowTarget, SelectionCoordinator, SelectionIntent, UiFlow, ViewMode,
 };
 use senatorial_notes::watcher::VaultWatcher;
-use senatorial_notes::{EncryptedSession, FileStamp, Note, NoteSummary, TrashEntry, Vault};
+use senatorial_notes::{
+    EncryptedSession, FileStamp, Note, NoteMetadata, NoteSummary, NotebookEntry, TrashEntry, Vault,
+};
 use sourceview5::prelude::*;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -90,6 +95,7 @@ struct AppState {
     title_dirty: bool,
     title_draft: String,
     flow: UiFlow,
+    filter: FilterState,
     last_sensitive_activity: Option<Instant>,
 }
 
@@ -108,6 +114,7 @@ struct RowWidgets {
     title: gtk::Label,
     preview: gtk::Label,
     pin: gtk::Image,
+    archived: gtk::Image,
 }
 
 type RowWidgetMap = Rc<RefCell<HashMap<Uuid, RowWidgets>>>;
@@ -166,12 +173,52 @@ struct Widgets {
     content_split: adw::NavigationSplitView,
     all_notes_button: gtk::Button,
     inbox_button: gtk::Button,
+    pinned_button: gtk::Button,
+    recently_edited_button: gtk::Button,
+    archive_button: gtk::Button,
     trash_button: gtk::Button,
+    /// Dynamic list of user notebooks (everything except `Inbox`, which has
+    /// its own fixed sidebar row). One `gtk::ListBox` row per notebook, in
+    /// the same order as `notebook_rows`.
+    notebook_list: gtk::ListBox,
+    notebook_menu: gtk::PopoverMenu,
+    notebook_rows: Rc<RefCell<Vec<PathBuf>>>,
+    notebook_events: Rc<SignalGate>,
+    /// Sidebar tag filter chips, rebuilt alongside the note list.
+    tags_flow: gtk::FlowBox,
+    tags_events: Rc<SignalGate>,
     document_stack: gtk::Stack,
     title: gtk::Entry,
+    /// Chip row for the active note's tags, shown between the title and the
+    /// formatting toolbar. Rebuilt whenever the active note or its tags
+    /// change; hidden while no note is open or the open note is locked.
+    tags_row: gtk::Box,
+    tag_chips: gtk::Box,
+    tag_add_entry: gtk::Entry,
     buffer: sourceview5::Buffer,
     editor: sourceview5::View,
+    /// The single outstanding debounced Markdown live-preview style
+    /// recompute, if one is armed. A separate timer from the autosave ones
+    /// in `PendingSaves` - restyling and saving are independent concerns
+    /// with independent delays.
+    style_recompute_source: Rc<RefCell<Option<glib::SourceId>>>,
     formatting_bar: gtk::ScrolledWindow,
+    /// Bold/Italic toolbar buttons. The existing theme/accent-aware
+    /// `brand-accent` CSS class is toggled on whichever are active at the
+    /// cursor/selection (see `active_formats_at`) - plain buttons rather
+    /// than `GtkToggleButton`s, since they are also wired to
+    /// `app.format-*` via `set_action_name` and a toggle button's own
+    /// click-driven active state would fight this external,
+    /// cursor-position-driven one.
+    format_bold_button: gtk::Button,
+    format_italic_button: gtk::Button,
+    /// The single outstanding idle-deferred toolbar active-state update, if
+    /// one is armed. See `schedule_format_toolbar_update`.
+    format_toolbar_update_source: Rc<RefCell<Option<glib::SourceId>>>,
+    /// The last state actually applied to the toolbar buttons, so a
+    /// same-state re-notification (cursor moves within a run of identically
+    /// formatted text) never re-touches the buttons' CSS classes.
+    format_toolbar_state: Rc<Cell<ActiveFormats>>,
     save_status: gtk::Label,
     locked_copy: gtk::Label,
     trash_detail_title: gtk::Label,
@@ -183,8 +230,12 @@ struct Controls {
     create_vault: gtk::Button,
     open_vault: gtk::Button,
     new_note: gtk::Button,
+    new_notebook: gtk::Button,
     all_notes: gtk::Button,
     inbox: gtk::Button,
+    pinned: gtk::Button,
+    recently_edited: gtk::Button,
+    archive: gtk::Button,
     trash: gtk::Button,
     library_toggle: gtk::Button,
     back_to_notes: gtk::Button,
@@ -290,7 +341,7 @@ fn build_application(application: &Application) {
         let pending = pending.clone();
         controls.all_notes.connect_clicked(move |_| {
             cancel_all_timers(&pending);
-            switch_view(ViewMode::Notes, &state, &widgets);
+            switch_view(ViewMode::AllNotes, &state, &widgets);
         });
     }
 
@@ -300,8 +351,83 @@ fn build_application(application: &Application) {
         let pending = pending.clone();
         controls.inbox.connect_clicked(move |_| {
             cancel_all_timers(&pending);
-            switch_view(ViewMode::Inbox, &state, &widgets);
+            switch_view(ViewMode::Notebook(PathBuf::from("Inbox")), &state, &widgets);
         });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        controls.pinned.connect_clicked(move |_| {
+            cancel_all_timers(&pending);
+            switch_view(ViewMode::Pinned, &state, &widgets);
+        });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        controls.recently_edited.connect_clicked(move |_| {
+            cancel_all_timers(&pending);
+            switch_view(ViewMode::RecentlyEdited, &state, &widgets);
+        });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        controls.archive.connect_clicked(move |_| {
+            cancel_all_timers(&pending);
+            switch_view(ViewMode::Archive, &state, &widgets);
+        });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        controls
+            .new_notebook
+            .connect_clicked(move |_| present_new_notebook_dialog(None, &state, &widgets));
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let notebook_list = widgets.notebook_list.clone();
+        notebook_list.connect_row_selected(move |_, row| {
+            if widgets.notebook_events.is_suppressed() {
+                return;
+            }
+            let Some(row) = row else {
+                return;
+            };
+            let path = {
+                widgets
+                    .notebook_rows
+                    .borrow()
+                    .get(row.index() as usize)
+                    .cloned()
+            };
+            if let Some(path) = path {
+                switch_view(ViewMode::Notebook(path), &state, &widgets);
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        widgets
+            .tag_add_entry
+            .clone()
+            .connect_activate(move |entry| {
+                let tag = entry.text().to_string();
+                entry.set_text("");
+                add_tag_to_active_note(&tag, &state, &widgets);
+            });
     }
 
     {
@@ -320,6 +446,36 @@ fn build_application(application: &Application) {
         let pending = pending.clone();
         let buffer = widgets.buffer.clone();
         buffer.connect_changed(move |_| schedule_body_save(&state, &widgets, &pending));
+    }
+
+    {
+        // A separate debounce from the autosave one above - restyling and
+        // saving are independent concerns with independent delays. Skipped
+        // during a programmatic load (editor_events suppressed): that path
+        // restyles synchronously in display_document instead.
+        let widgets = widgets.clone();
+        let buffer = widgets.buffer.clone();
+        buffer.connect_changed(move |_| {
+            if widgets.editor_events.is_suppressed() {
+                return;
+            }
+            schedule_style_recompute(&widgets);
+        });
+    }
+
+    {
+        // `cursor-position` is a GObject property notify, which GObject
+        // always fires synchronously at the point the property changes -
+        // here, from inside GtkTextBuffer::delete/insert while
+        // apply_format_to_buffer is still on the stack. Mutating other
+        // widgets (the toolbar buttons' CSS classes) directly from this
+        // handler would do it re-entrantly, nested inside an active buffer
+        // mutation; schedule_format_toolbar_update defers the actual work
+        // to an idle callback so it always runs as its own top-level main
+        // loop turn instead (see that function's doc comment).
+        let widgets = widgets.clone();
+        let buffer = widgets.buffer.clone();
+        buffer.connect_cursor_position_notify(move |_| schedule_format_toolbar_update(&widgets));
     }
 
     {
@@ -452,6 +608,12 @@ fn build_application(application: &Application) {
         widgets.window.clone().connect_close_request(move |_| {
             cancel_all_timers(&pending);
             cancel_pending_selection(&widgets);
+            if let Some(source) = widgets.style_recompute_source.borrow_mut().take() {
+                source.remove();
+            }
+            if let Some(source) = widgets.format_toolbar_update_source.borrow_mut().take() {
+                source.remove();
+            }
             if persist_active(&state, &widgets, true) {
                 clear_sensitive_documents(&state);
                 // Detach the shared context menu before its parent is disposed.
@@ -583,6 +745,11 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     delete_button.set_tooltip_text(Some("Move note to Trash"));
     delete_button.update_property(&[gtk::accessible::Property::Label("Move note to Trash")]);
     header.pack_start(&delete_button);
+    let note_info_button = gtk::Button::from_icon_name("dialog-information-symbolic");
+    note_info_button.set_action_name(Some("app.note-info"));
+    note_info_button.set_tooltip_text(Some("Note information (Alt+Enter)"));
+    note_info_button.update_property(&[gtk::accessible::Property::Label("Note information")]);
+    header.pack_end(&note_info_button);
     let menu = application_menu();
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
@@ -616,12 +783,60 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     all_notes.add_css_class("sidebar-selected");
     all_notes.set_tooltip_text(Some("Show every note in this vault"));
     sidebar.append(&all_notes);
-    let inbox = sidebar_button("Inbox", "mail-inbox-symbolic");
-    inbox.set_tooltip_text(Some("Show notes in the Inbox notebook"));
+    // Displayed as "Unfiled" - the on-disk notebook directory stays named
+    // "Inbox" for backward compatibility with existing vaults; only the
+    // UI-facing label changes. See `ViewMode::heading`.
+    let inbox = sidebar_button("Unfiled", "mail-inbox-symbolic");
+    inbox.set_tooltip_text(Some("Show notes not filed into another notebook"));
     sidebar.append(&inbox);
+    let pinned = sidebar_button("Pinned", "emblem-favorite-symbolic");
+    pinned.set_tooltip_text(Some("Show pinned notes"));
+    sidebar.append(&pinned);
+    let recently_edited = sidebar_button("Recently Edited", "document-open-recent-symbolic");
+    recently_edited.set_tooltip_text(Some("Show recently edited notes"));
+    sidebar.append(&recently_edited);
+    let archive = sidebar_button("Archive", "folder-symbolic");
+    archive.set_tooltip_text(Some("Show archived notes"));
+    sidebar.append(&archive);
     let trash = sidebar_button("Trash", "user-trash-symbolic");
     trash.set_tooltip_text(Some("Show deleted notes"));
     sidebar.append(&trash);
+
+    let notebooks_header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    notebooks_header.set_margin_top(10);
+    let notebooks_heading = gtk::Label::new(Some("NOTEBOOKS"));
+    notebooks_heading.set_xalign(0.0);
+    notebooks_heading.set_hexpand(true);
+    notebooks_heading.add_css_class("sidebar-section-title");
+    let new_notebook = gtk::Button::from_icon_name("list-add-symbolic");
+    new_notebook.add_css_class("flat");
+    new_notebook.set_tooltip_text(Some("New notebook"));
+    new_notebook.update_property(&[gtk::accessible::Property::Label("New notebook")]);
+    notebooks_header.append(&notebooks_heading);
+    notebooks_header.append(&new_notebook);
+    sidebar.append(&notebooks_header);
+
+    let notebook_list = gtk::ListBox::new();
+    notebook_list.set_selection_mode(gtk::SelectionMode::Single);
+    notebook_list.add_css_class("notebook-list");
+    let notebook_menu = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
+    notebook_menu.set_has_arrow(false);
+    notebook_menu.set_halign(gtk::Align::Start);
+    notebook_menu.set_parent(&notebook_list);
+    sidebar.append(&notebook_list);
+
+    let tags_heading = gtk::Label::new(Some("TAGS"));
+    tags_heading.set_xalign(0.0);
+    tags_heading.set_margin_top(10);
+    tags_heading.add_css_class("sidebar-section-title");
+    sidebar.append(&tags_heading);
+    let tags_flow = gtk::FlowBox::new();
+    tags_flow.set_selection_mode(gtk::SelectionMode::None);
+    tags_flow.set_max_children_per_line(4);
+    tags_flow.set_row_spacing(4);
+    tags_flow.set_column_spacing(4);
+    sidebar.append(&tags_flow);
+
     let privacy_badge = gtk::Label::new(Some("Offline by design"));
     privacy_badge.set_valign(gtk::Align::End);
     privacy_badge.set_vexpand(true);
@@ -629,7 +844,17 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     privacy_badge.add_css_class("caption");
     privacy_badge.add_css_class("dim-label");
     sidebar.append(&privacy_badge);
-    library_split.set_sidebar(Some(&sidebar));
+    // The sidebar now holds a variable-height notebook/tag list, unlike the
+    // three fixed buttons of v0.1, so it must scroll rather than impose its
+    // natural height as a hard minimum - the same minimum-window discipline
+    // every other page in this window already follows (see the window
+    // size_request comment above).
+    let sidebar_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&sidebar)
+        .build();
+    library_split.set_sidebar(Some(&sidebar_scroll));
 
     let content_split = adw::NavigationSplitView::new();
     content_split.set_vexpand(true);
@@ -655,7 +880,26 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     empty_trash_button.add_css_class("destructive-action");
     empty_trash_button.set_visible(false);
     empty_trash_button.set_tooltip_text(Some("Permanently delete every note in Trash"));
+    let sort_menu = gio::Menu::new();
+    for (label, target) in [
+        ("Last Edited", "last-edited"),
+        ("Date Created", "date-created"),
+        ("Title A–Z", "title-asc"),
+        ("Title Z–A", "title-za"),
+    ] {
+        let item = gio::MenuItem::new(Some(label), None);
+        item.set_action_and_target_value(Some("app.set-sort-order"), Some(&target.to_variant()));
+        sort_menu.append_item(&item);
+    }
+    let sort_button = gtk::MenuButton::builder()
+        .icon_name("view-sort-descending-symbolic")
+        .menu_model(&sort_menu)
+        .tooltip_text("Sort notes")
+        .build();
+    sort_button.add_css_class("flat");
+    sort_button.update_property(&[gtk::accessible::Property::Label("Sort notes")]);
     notes_header.append(&notes_heading);
+    notes_header.append(&sort_button);
     notes_header.append(&empty_trash_button);
     notes_box.append(&notes_header);
     let search = gtk::SearchEntry::builder()
@@ -738,14 +982,45 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     title_row.append(&save_status);
     editor_box.append(&title_row);
 
-    let formatting_bar = build_formatting_bar();
+    let tags_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    tags_row.add_css_class("tags-row");
+    tags_row.set_margin_start(16);
+    tags_row.set_margin_end(16);
+    tags_row.set_margin_bottom(10);
+    tags_row.set_visible(false);
+    let tag_chips = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    tag_chips.set_hexpand(true);
+    let tag_add_entry = gtk::Entry::builder()
+        .placeholder_text("Add tag…")
+        .max_width_chars(14)
+        .build();
+    tag_add_entry.add_css_class("tag-add-entry");
+    tag_add_entry.update_property(&[gtk::accessible::Property::Label("Add tag")]);
+    tags_row.append(&tag_chips);
+    tags_row.append(&tag_add_entry);
+    editor_box.append(&tags_row);
+
+    let (formatting_bar, format_bold_button, format_italic_button) = build_formatting_bar();
     editor_box.append(&formatting_bar);
     let buffer = sourceview5::Buffer::new(None::<&gtk::TextTagTable>);
+    // Editor V2's own markdown_spans-driven tags (registered below) are now
+    // the single, deliberate, tested source of Markdown visual styling.
+    // GtkSourceView's built-in language-based syntax highlighting is left
+    // disabled: two independent systems assigning Pango attributes (weight,
+    // style) to the same text is exactly the kind of interaction that is
+    // very hard to reason about precisely, and a real-machine acceptance
+    // pass found Ctrl+B visually producing bold+italic instead of bold-only
+    // - most plausibly this stacking, since Editor V2's own span computation
+    // was verified in isolation (and by a dedicated pipeline test) to
+    // produce Bold only for that exact input. `set_language` is still set
+    // for GtkSourceView's other language-aware behaviour (e.g. matching
+    // bracket detection), just not its highlighting.
     if let Some(language) = sourceview5::LanguageManager::default().language("markdown") {
         buffer.set_language(Some(&language));
-        buffer.set_highlight_syntax(true);
     }
+    buffer.set_highlight_syntax(false);
     buffer.set_highlight_matching_brackets(true);
+    register_markdown_style_tags(&buffer);
     let editor = sourceview5::View::with_buffer(&buffer);
     editor.add_css_class("editor-view");
     editor.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -884,12 +1159,29 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
             content_split,
             all_notes_button: all_notes.clone(),
             inbox_button: inbox.clone(),
+            pinned_button: pinned.clone(),
+            recently_edited_button: recently_edited.clone(),
+            archive_button: archive.clone(),
             trash_button: trash.clone(),
+            notebook_list,
+            notebook_menu,
+            notebook_rows: Rc::new(RefCell::new(Vec::new())),
+            notebook_events: Rc::new(SignalGate::default()),
+            tags_flow,
+            tags_events: Rc::new(SignalGate::default()),
             document_stack,
             title,
+            tags_row,
+            tag_chips,
+            tag_add_entry,
             buffer,
             editor,
+            style_recompute_source: Rc::new(RefCell::new(None)),
             formatting_bar,
+            format_bold_button,
+            format_italic_button,
+            format_toolbar_update_source: Rc::new(RefCell::new(None)),
+            format_toolbar_state: Rc::new(Cell::new(ActiveFormats::default())),
             save_status,
             locked_copy,
             trash_detail_title,
@@ -900,8 +1192,12 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
             create_vault,
             open_vault,
             new_note,
+            new_notebook,
             all_notes,
             inbox,
+            pinned,
+            recently_edited,
+            archive,
             trash,
             library_toggle,
             back_to_notes,
@@ -923,6 +1219,7 @@ fn application_menu() -> gio::Menu {
     security.append(Some("Remove Encryption…"), Some("app.remove-encryption"));
     menu.append_section(Some("Encrypted Note"), &security);
     let note = gio::Menu::new();
+    note.append(Some("Note Information"), Some("app.note-info"));
     note.append(Some("Move to Trash"), Some("app.move-to-trash"));
     menu.append_section(Some("Note"), &note);
     menu.append(Some("About SenatorialNotes"), Some("app.about"));
@@ -930,7 +1227,7 @@ fn application_menu() -> gio::Menu {
     menu
 }
 
-fn build_formatting_bar() -> gtk::ScrolledWindow {
+fn build_formatting_bar() -> (gtk::ScrolledWindow, gtk::Button, gtk::Button) {
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     bar.set_margin_start(12);
     bar.set_margin_end(12);
@@ -964,10 +1261,7 @@ fn build_formatting_bar() -> gtk::ScrolledWindow {
         .build();
     bar.append(&styles);
 
-    for (label, tooltip, action) in [
-        ("B", "Bold (Ctrl+B)", "app.format-bold"),
-        ("I", "Italic (Ctrl+I)", "app.format-italic"),
-    ] {
+    fn format_button(bar: &gtk::Box, label: &str, tooltip: &str, action: &str) -> gtk::Button {
         let button = gtk::Button::with_label(label);
         button.add_css_class("flat");
         button.add_css_class("format-button");
@@ -975,7 +1269,10 @@ fn build_formatting_bar() -> gtk::ScrolledWindow {
         button.set_action_name(Some(action));
         button.update_property(&[gtk::accessible::Property::Label(tooltip)]);
         bar.append(&button);
+        button
     }
+    let bold_button = format_button(&bar, "B", "Bold (Ctrl+B)", "app.format-bold");
+    let italic_button = format_button(&bar, "I", "Italic (Ctrl+I)", "app.format-italic");
 
     let more_menu = gio::Menu::new();
     let inline = gio::Menu::new();
@@ -1006,7 +1303,7 @@ fn build_formatting_bar() -> gtk::ScrolledWindow {
         .tooltip_text("More Markdown formatting")
         .build();
     bar.append(&more);
-    bar_scroll
+    (bar_scroll, bold_button, italic_button)
 }
 
 fn sidebar_button(label: &str, icon: &str) -> gtk::Button {
@@ -1131,7 +1428,8 @@ fn open_vault(path: &Path, create: bool, state: &Rc<RefCell<AppState>>, widgets:
                 state.trash.clear();
                 state.body_dirty = false;
                 state.title_dirty = false;
-                state.flow.switch_view(ViewMode::Notes);
+                state.flow.switch_view(ViewMode::AllNotes);
+                state.filter = FilterState::default();
                 state.config.save().err().map(|error| error.to_string())
             };
             if let Some(error) = watcher_error {
@@ -1154,10 +1452,12 @@ fn open_vault(path: &Path, create: bool, state: &Rc<RefCell<AppState>>, widgets:
                 widgets.library_split.set_show_sidebar(false);
             }
             widgets.content_split.set_show_content(false);
-            apply_view_chrome(ViewMode::Notes, widgets);
+            apply_view_chrome(&ViewMode::AllNotes, widgets);
             if !refresh_current_view(state, widgets) {
                 return;
             }
+            render_notebook_list(state, widgets);
+            render_tags_list(state, widgets);
             let is_empty = { state.borrow().notes.is_empty() };
             if is_empty {
                 create_new_note(
@@ -1175,7 +1475,7 @@ fn open_vault(path: &Path, create: bool, state: &Rc<RefCell<AppState>>, widgets:
 }
 
 fn switch_view(mode: ViewMode, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
-    let already_selected = { state.borrow().flow.view() == mode };
+    let already_selected = { state.borrow().flow.view() == &mode };
     if already_selected {
         if widgets.library_split.is_collapsed() {
             widgets.library_split.set_show_sidebar(false);
@@ -1188,10 +1488,10 @@ fn switch_view(mode: ViewMode, state: &Rc<RefCell<AppState>>, widgets: &Widgets)
     stash_or_lock_active(state);
     {
         let mut state = state.borrow_mut();
-        state.flow.switch_view(mode);
+        state.flow.switch_view(mode.clone());
     }
     widgets.search.set_text("");
-    apply_view_chrome(mode, widgets);
+    apply_view_chrome(&mode, widgets);
     widgets.document_stack.set_visible_child_name("empty");
     if widgets.library_split.is_collapsed() {
         widgets.library_split.set_show_sidebar(false);
@@ -1202,17 +1502,31 @@ fn switch_view(mode: ViewMode, state: &Rc<RefCell<AppState>>, widgets: &Widgets)
     }
 }
 
+/// Notebook new notes are created in: the currently selected real notebook,
+/// or `Inbox` as the deterministic fallback for every smart view (and before
+/// any vault is loaded) - see the "Inbox is special" note in
+/// `Vault::is_reserved_notebook`.
+fn target_notebook_for_new_note(state: &AppState) -> PathBuf {
+    match state.flow.view() {
+        ViewMode::Notebook(path) => path.clone(),
+        _ => PathBuf::from("Inbox"),
+    }
+}
+
 fn create_new_note(
     state: &Rc<RefCell<AppState>>,
     widgets: &Widgets,
     pending: &Rc<RefCell<PendingSaves>>,
 ) {
-    let current_view = { state.borrow().flow.view() };
-    if !matches!(current_view, ViewMode::Notes | ViewMode::Inbox) {
+    let target_notebook = { target_notebook_for_new_note(&state.borrow()) };
+    let already_there =
+        { state.borrow().flow.view() == &ViewMode::Notebook(target_notebook.clone()) };
+    if !already_there {
         cancel_all_timers(pending);
-        switch_view(ViewMode::Notes, state, widgets);
-        let switched_to_notes = { state.borrow().flow.view() == ViewMode::Notes };
-        if !switched_to_notes {
+        switch_view(ViewMode::Notebook(target_notebook.clone()), state, widgets);
+        let switched =
+            { state.borrow().flow.view() == &ViewMode::Notebook(target_notebook.clone()) };
+        if !switched {
             return;
         }
     }
@@ -1226,7 +1540,7 @@ fn create_new_note(
     let Some(vault) = vault else {
         return;
     };
-    match vault.create_note("Untitled", Path::new("Inbox")) {
+    match vault.create_note("Untitled", &target_notebook) {
         Ok(note) => {
             let id = note.metadata.id;
             let summary = NoteSummary::from(&note);
@@ -1249,38 +1563,51 @@ fn create_new_note(
     }
 }
 
-fn apply_view_chrome(mode: ViewMode, widgets: &Widgets) {
-    widgets.notes_heading.set_label(mode.heading());
+fn apply_view_chrome(mode: &ViewMode, widgets: &Widgets) {
+    widgets.notes_heading.set_label(&mode.heading());
     widgets
         .search
-        .set_placeholder_text(Some(mode.search_placeholder()));
+        .set_placeholder_text(Some(&mode.search_placeholder()));
     widgets
         .empty_trash_button
-        .set_visible(mode == ViewMode::Trash);
+        .set_visible(*mode == ViewMode::Trash);
     update_library_selection(mode, widgets);
 }
 
-fn update_library_selection(mode: ViewMode, widgets: &Widgets) {
+fn update_library_selection(mode: &ViewMode, widgets: &Widgets) {
     for button in [
         &widgets.all_notes_button,
         &widgets.inbox_button,
+        &widgets.pinned_button,
+        &widgets.recently_edited_button,
+        &widgets.archive_button,
         &widgets.trash_button,
     ] {
         button.remove_css_class("sidebar-selected");
     }
+    let inbox = Path::new("Inbox");
     match mode {
-        ViewMode::Notes => widgets.all_notes_button.add_css_class("sidebar-selected"),
-        ViewMode::Inbox => widgets.inbox_button.add_css_class("sidebar-selected"),
+        ViewMode::AllNotes => widgets.all_notes_button.add_css_class("sidebar-selected"),
+        ViewMode::Notebook(path) if path.as_path() == inbox => {
+            widgets.inbox_button.add_css_class("sidebar-selected");
+        }
+        ViewMode::Pinned => widgets.pinned_button.add_css_class("sidebar-selected"),
+        ViewMode::RecentlyEdited => widgets
+            .recently_edited_button
+            .add_css_class("sidebar-selected"),
+        ViewMode::Archive => widgets.archive_button.add_css_class("sidebar-selected"),
         ViewMode::Trash => widgets.trash_button.add_css_class("sidebar-selected"),
+        ViewMode::Notebook(_) => {}
     }
+    update_notebook_list_selection(mode, widgets);
 }
 
 fn select_first_row(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     let preferred = {
         let state = state.borrow();
         match state.flow.view() {
-            ViewMode::Notes | ViewMode::Inbox => state.flow.selected_note().map(RowTarget::Note),
             ViewMode::Trash => state.flow.selected_trash().map(RowTarget::Trash),
+            _ => state.flow.selected_note().map(RowTarget::Note),
         }
     };
     let target = preferred
@@ -1292,12 +1619,48 @@ fn select_first_row(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     };
     select_row_target(target, widgets);
     match target {
-        RowTarget::Note(id) => load_note_by_id(id, state, widgets),
+        RowTarget::Note(id) => select_note_without_prompting_if_locked(id, state, widgets),
         RowTarget::Trash(id) => show_trash_by_id(id, state, widgets),
     }
 }
 
+/// Loads note `id` and always prompts for its password immediately if it is
+/// a locked encrypted note. Reserved for calls that come from the user
+/// directly acting on *this specific* note - clicking its row, pressing
+/// next/previous with it as the target, or pressing the "Unlock Note"
+/// button - never from an automatic fallback selection. See
+/// `open_note_by_id`'s doc comment for why that distinction matters.
 fn load_note_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    open_note_by_id(id, state, widgets, true);
+}
+
+/// Loads note `id` and selects it in the sidebar, but - when it is a locked
+/// encrypted note - shows the locked placeholder (with its own "Unlock
+/// Note" button) without launching the password dialog.
+///
+/// Used for automatic fallback selection: switching to a notebook or smart
+/// view (including Inbox) and picking whatever note sorts first, or picking
+/// an adjacent note after the previously-selected one was removed. In both
+/// cases the note that ends up selected is incidental to what the user
+/// actually asked for - browsing to a view, or deleting something else -
+/// not a specific note they chose to open. Auto-prompting there is exactly
+/// how merely switching to Inbox (or any view) could end up launching a
+/// password dialog for whichever encrypted note happened to be first: see
+/// the "Inbox never requires a password" note in `SECURITY.md`.
+fn select_note_without_prompting_if_locked(
+    id: Uuid,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+) {
+    open_note_by_id(id, state, widgets, false);
+}
+
+fn open_note_by_id(
+    id: Uuid,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    prompt_if_locked: bool,
+) {
     let (vault, summary) = {
         let state = state.borrow();
         let Some(vault) = state.vault.clone() else {
@@ -1319,6 +1682,9 @@ fn load_note_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
             return;
         }
         show_locked_placeholder(widgets);
+        if !prompt_if_locked {
+            return;
+        }
         let state_for_unlock = state.clone();
         let widgets_for_unlock = widgets.clone();
         let relative = summary.relative_path.clone();
@@ -1487,12 +1853,18 @@ fn display_document(document: ActiveDocument, state: &Rc<RefCell<AppState>>, wid
     widgets.formatting_bar.set_sensitive(true);
     widgets.title.set_text(&title);
     set_buffer_text_silently(&widgets.buffer, &body);
+    // Style the note as soon as it opens rather than waiting for the user's
+    // first edit; loading is already suppressed above, so the debounced
+    // recompute wired to buffer::changed would otherwise never fire here.
+    recompute_markdown_styles(&widgets.buffer);
+    schedule_format_toolbar_update(widgets);
     widgets.document_stack.set_visible_child_name("editor");
     widgets.save_status.set_label(if encrypted {
         "Unlocked · encrypted at rest"
     } else {
         "Saved"
     });
+    render_active_tags(state, widgets);
 }
 
 fn show_locked_placeholder(widgets: &Widgets) {
@@ -1503,6 +1875,44 @@ fn show_locked_placeholder(widgets: &Widgets) {
     widgets.editor.set_sensitive(false);
     widgets.formatting_bar.set_sensitive(false);
     widgets.document_stack.set_visible_child_name("locked");
+    widgets.tags_row.set_visible(false);
+}
+
+/// Rebuilds the active note's tag-chip row from `state.active`. Hidden
+/// entirely when no note is open (or it is locked, in which case `active` is
+/// `None` and its real tags are not in memory at all).
+fn render_active_tags(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let tags = {
+        state
+            .borrow()
+            .active
+            .as_ref()
+            .map(|active| active.note().metadata.tags.clone())
+    };
+    let Some(tags) = tags else {
+        widgets.tags_row.set_visible(false);
+        return;
+    };
+    widgets.tags_row.set_visible(true);
+    while let Some(child) = widgets.tag_chips.first_child() {
+        widgets.tag_chips.remove(&child);
+    }
+    for tag in tags {
+        let chip = gtk::Button::new();
+        chip.add_css_class("tag-chip");
+        chip.add_css_class("flat");
+        chip.set_label(&format!("{tag} ×"));
+        chip.set_tooltip_text(Some(&format!("Remove tag \"{tag}\"")));
+        chip.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Remove tag {tag}"
+        ))]);
+        let state = state.clone();
+        let widgets_for_remove = widgets.clone();
+        chip.connect_clicked(move |_| {
+            remove_tag_from_active_note(&tag, &state, &widgets_for_remove);
+        });
+        widgets.tag_chips.append(&chip);
+    }
 }
 
 fn schedule_body_save(
@@ -1768,22 +2178,30 @@ fn update_active_summary(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                 note.metadata.title.clone(),
                 note.body.clone(),
                 note.relative_path.clone(),
-                active.is_encrypted(),
                 note.metadata.pinned,
+                note.metadata.archived,
+                note.metadata.created_at,
                 note.metadata.updated_at,
                 note.metadata.tags.clone(),
             )
         })
     };
-    let Some((id, title, body, path, encrypted, pinned, updated_at, tags)) = active_snapshot else {
+    let Some((id, title, body, path, pinned, archived, created_at, updated_at, tags)) =
+        active_snapshot
+    else {
         return;
     };
+    // This function only ever runs against `state.active`, which - for an
+    // encrypted note - only ever holds it while unlocked. Its real,
+    // already-decrypted body is exactly as available as the plaintext
+    // case, so the preview is computed the same way for both; the summary
+    // this function updates is a purely in-memory Vec (never written to
+    // disk or cache), so showing it here never creates a plaintext side
+    // channel - it only reflects what is already decrypted and displayed
+    // in the open editor. See the "Locked encrypted notes" note in
+    // `SECURITY.md`.
     let preview_limit = { state.borrow().config.appearance.note_preview_length };
-    let preview = if encrypted {
-        "Encrypted — unlock to view".into()
-    } else {
-        truncate_preview(&body, preview_limit)
-    };
+    let preview = truncate_preview(&body, preview_limit);
     if let Some(summary) = state
         .borrow_mut()
         .notes
@@ -1792,38 +2210,40 @@ fn update_active_summary(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     {
         summary.relative_path = path;
         summary.pinned = pinned;
+        summary.archived = archived;
+        summary.created_at = created_at;
         summary.updated_at = updated_at;
-        // Keep locked encrypted summaries private even during an unlocked
-        // session; this also prevents plaintext from entering persistent or
-        // list-level search data.
-        if !encrypted {
-            summary.title = title.clone();
-            summary.preview = preview.clone();
-            summary.body = body.clone();
-            summary.tags = tags.clone();
-        }
+        // The note is open and decrypted, so its true protected metadata is
+        // known again - this is the one place a locked summary transitions
+        // back to unlocked (the reverse happens in `lock_all_encrypted`,
+        // which resets every field this function sets back to the exact
+        // `NoteSummary::locked()` placeholder).
+        summary.locked = false;
+        summary.title = title.clone();
+        summary.preview = preview.clone();
+        summary.body = body.clone();
+        summary.tags = tags.clone();
     }
     let row_widgets = { widgets.row_widgets.borrow().get(&id).cloned() };
     if let Some(row_widgets) = row_widgets {
         row_widgets.pin.set_visible(pinned);
-        if !encrypted {
-            row_widgets.title.set_label(&title);
-            row_widgets.preview.set_label(&preview);
-        }
+        row_widgets.archived.set_visible(archived);
+        row_widgets.title.set_label(&title);
+        row_widgets.preview.set_label(&preview);
     }
 }
 
 fn refresh_current_view(state: &Rc<RefCell<AppState>>, widgets: &Widgets) -> bool {
     let (vault, mode) = {
         let state = state.borrow();
-        (state.vault.clone(), state.flow.view())
+        (state.vault.clone(), state.flow.view().clone())
     };
     let Some(vault) = vault else {
         return false;
     };
     let result = match mode {
-        ViewMode::Notes | ViewMode::Inbox => vault.scan_notes().map(|notes| (Some(notes), None)),
         ViewMode::Trash => vault.scan_trash().map(|trash| (None, Some(trash))),
+        _ => vault.scan_notes().map(|notes| (Some(notes), None)),
     };
     let (notes, trash) = match result {
         Ok(result) => result,
@@ -1852,25 +2272,22 @@ fn render_note_list(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     let (mode, selected_note, selected_trash, density, notes, trash) = {
         let state = state.borrow();
         (
-            state.flow.view(),
+            state.flow.view().clone(),
             state.flow.selected_note(),
             state.flow.selected_trash(),
             state.config.appearance.note_list_density,
-            match state.flow.view() {
-                ViewMode::Inbox => filtered_inbox(&state, &query),
-                ViewMode::Notes | ViewMode::Trash => filtered_notes(&state, &query),
-            },
+            filtered_notes(&state, &query),
             filtered_trash(&state, &query),
         )
     };
     let targets: Vec<RowTarget> = match mode {
-        ViewMode::Notes | ViewMode::Inbox => notes
-            .iter()
-            .map(|summary| RowTarget::Note(summary.id))
-            .collect(),
         ViewMode::Trash => trash
             .iter()
             .map(|entry| RowTarget::Trash(entry.id))
+            .collect(),
+        _ => notes
+            .iter()
+            .map(|summary| RowTarget::Note(summary.id))
             .collect(),
     };
     let has_rows = !targets.is_empty();
@@ -1883,24 +2300,6 @@ fn render_note_list(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     }
     widgets.row_widgets.borrow_mut().clear();
     match mode {
-        ViewMode::Notes | ViewMode::Inbox => {
-            for summary in notes {
-                let (row, row_widgets) = note_row(
-                    &summary.title,
-                    &summary.preview,
-                    summary.encrypted,
-                    summary.pinned,
-                    density,
-                    note_context_menu(summary.id, summary.pinned, summary.encrypted),
-                    &widgets.row_menu,
-                );
-                widgets
-                    .row_widgets
-                    .borrow_mut()
-                    .insert(summary.id, row_widgets);
-                widgets.note_list.append(&row);
-            }
-        }
         ViewMode::Trash => {
             for entry in trash {
                 let subtitle = if entry.encrypted {
@@ -1909,11 +2308,14 @@ fn render_note_list(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                     format!("From {}", entry.original_relative_path.display())
                 };
                 let (row, row_widgets) = note_row(
-                    &entry.title,
-                    &subtitle,
-                    entry.encrypted,
-                    false,
-                    density,
+                    NoteRowSpec {
+                        title: &entry.title,
+                        preview: &subtitle,
+                        encrypted: entry.encrypted,
+                        pinned: false,
+                        archived: false,
+                        density,
+                    },
                     trash_context_menu(entry.id),
                     &widgets.row_menu,
                 );
@@ -1924,14 +2326,38 @@ fn render_note_list(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                 widgets.note_list.append(&row);
             }
         }
+        _ => {
+            for summary in notes {
+                let (row, row_widgets) = note_row(
+                    NoteRowSpec {
+                        title: &summary.title,
+                        preview: &summary.preview,
+                        encrypted: summary.encrypted,
+                        pinned: summary.pinned,
+                        archived: summary.archived,
+                        density,
+                    },
+                    note_context_menu(
+                        summary.id,
+                        summary.pinned,
+                        summary.archived,
+                        summary.encrypted,
+                    ),
+                    &widgets.row_menu,
+                );
+                widgets
+                    .row_widgets
+                    .borrow_mut()
+                    .insert(summary.id, row_widgets);
+                widgets.note_list.append(&row);
+            }
+        }
     }
     let selected = match mode {
-        ViewMode::Notes | ViewMode::Inbox => {
-            selected_note.and_then(|id| widgets.selection.index_of(RowTarget::Note(id)))
-        }
         ViewMode::Trash => {
             selected_trash.and_then(|id| widgets.selection.index_of(RowTarget::Trash(id)))
         }
+        _ => selected_note.and_then(|id| widgets.selection.index_of(RowTarget::Note(id))),
     };
     if let Some(index) = selected
         && let Some(row) = widgets.note_list.row_at_index(index as i32)
@@ -1946,8 +2372,17 @@ fn render_note_list(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
             ("No matches", "Try a different search.")
         } else {
             match mode {
-                ViewMode::Notes => ("No notes yet", "Create a new note to start writing."),
-                ViewMode::Inbox => ("Inbox is empty", "New notes appear in the Inbox."),
+                ViewMode::AllNotes => ("No notes yet", "Create a new note to start writing."),
+                ViewMode::Notebook(_) => (
+                    "No notes here",
+                    "New notes you create here appear in this notebook.",
+                ),
+                ViewMode::Pinned => ("No pinned notes", "Pin a note to see it here."),
+                ViewMode::RecentlyEdited => ("Nothing recent", "Notes you edit will appear here."),
+                ViewMode::Archive => (
+                    "Nothing archived",
+                    "Archive a note to remove it from your day-to-day views.",
+                ),
                 ViewMode::Trash => ("Trash is empty", "Deleted notes will appear here."),
             }
         };
@@ -1965,12 +2400,20 @@ fn insert_note_row(
 ) {
     let density = { state.borrow().config.appearance.note_list_density };
     let (row, row_widgets) = note_row(
-        &summary.title,
-        &summary.preview,
-        summary.encrypted,
-        summary.pinned,
-        density,
-        note_context_menu(summary.id, summary.pinned, summary.encrypted),
+        NoteRowSpec {
+            title: &summary.title,
+            preview: &summary.preview,
+            encrypted: summary.encrypted,
+            pinned: summary.pinned,
+            archived: summary.archived,
+            density,
+        },
+        note_context_menu(
+            summary.id,
+            summary.pinned,
+            summary.archived,
+            summary.encrypted,
+        ),
         &widgets.row_menu,
     );
     let _selection_guard = widgets.selection.suppress();
@@ -1993,11 +2436,7 @@ fn replace_note_row(summary: &NoteSummary, state: &Rc<RefCell<AppState>>, widget
     let desired_index = {
         let query = widgets.search.text().to_string();
         let state = state.borrow();
-        let visible = match state.flow.view() {
-            ViewMode::Inbox => filtered_inbox(&state, &query),
-            ViewMode::Notes | ViewMode::Trash => filtered_notes(&state, &query),
-        };
-        visible
+        filtered_notes(&state, &query)
             .iter()
             .position(|candidate| candidate.id == summary.id)
             .unwrap_or(index)
@@ -2039,6 +2478,357 @@ fn remove_row_target(target: RowTarget, widgets: &Widgets) -> Option<usize> {
     Some(index)
 }
 
+/// Rebuilds the dynamic notebook list from the vault (everything except
+/// `Inbox`, which has its own fixed sidebar row). Called on vault open and
+/// after any notebook create/rename/delete or note move.
+fn render_notebook_list(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let vault = { state.borrow().vault.clone() };
+    let Some(vault) = vault else {
+        return;
+    };
+    let notebooks = match vault.list_notebooks() {
+        Ok(notebooks) => notebooks,
+        Err(error) => {
+            widgets
+                .save_status
+                .set_label(&format!("Could not list notebooks: {error}"));
+            return;
+        }
+    };
+    let notebooks: Vec<NotebookEntry> = notebooks
+        .into_iter()
+        .filter(|entry| entry.relative_path != Path::new("Inbox"))
+        .collect();
+
+    let _guard = widgets.notebook_events.suppress();
+    while let Some(row) = widgets.notebook_list.row_at_index(0) {
+        widgets.notebook_list.remove(&row);
+    }
+    let mut rows = Vec::with_capacity(notebooks.len());
+    for notebook in &notebooks {
+        let row = notebook_row(notebook, &widgets.notebook_menu);
+        widgets.notebook_list.append(&row);
+        rows.push(notebook.relative_path.clone());
+    }
+    *widgets.notebook_rows.borrow_mut() = rows;
+    drop(_guard);
+    let current_view = { state.borrow().flow.view().clone() };
+    update_notebook_list_selection(&current_view, widgets);
+}
+
+fn notebook_row(notebook: &NotebookEntry, notebook_menu: &gtk::PopoverMenu) -> gtk::ListBoxRow {
+    let depth = notebook
+        .relative_path
+        .components()
+        .count()
+        .saturating_sub(1);
+    let name = notebook
+        .relative_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Notebook");
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    content.set_margin_start(8 + (depth as i32) * 14);
+    content.set_margin_end(8);
+    content.set_margin_top(6);
+    content.set_margin_bottom(6);
+    let icon = gtk::Image::from_icon_name("folder-symbolic");
+    icon.set_pixel_size(14);
+    content.append(&icon);
+    let label = gtk::Label::new(Some(name));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    content.append(&label);
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&content));
+    row.update_property(&[gtk::accessible::Property::Label(&format!(
+        "Notebook: {name}"
+    ))]);
+
+    // Same shared-popover convention as `note_row`: the popover is owned by
+    // the list, not by each row, so a removed row finalizes cleanly.
+    let menu = notebook_context_menu(&notebook.relative_path);
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3);
+    let notebook_menu = notebook_menu.clone();
+    let anchor = row.downgrade();
+    gesture.connect_pressed(move |gesture, _, x, y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        let Some(anchor) = anchor.upgrade() else {
+            return;
+        };
+        let Some(list) = notebook_menu.parent() else {
+            return;
+        };
+        notebook_menu.set_menu_model(Some(&menu));
+        if let Some(point) =
+            anchor.compute_point(&list, &gtk::graphene::Point::new(x as f32, y as f32))
+        {
+            notebook_menu.set_pointing_to(Some(&gdk::Rectangle::new(
+                point.x() as i32,
+                point.y() as i32,
+                1,
+                1,
+            )));
+        }
+        notebook_menu.popup();
+    });
+    row.add_controller(gesture);
+    row
+}
+
+fn notebook_context_menu(relative_path: &Path) -> gio::Menu {
+    let path = relative_path.to_string_lossy().to_string();
+    let menu = gio::Menu::new();
+    append_path_targeted_menu_item(
+        &menu,
+        "New Child Notebook…",
+        "app.new-child-notebook",
+        &path,
+    );
+    append_path_targeted_menu_item(&menu, "Rename…", "app.rename-notebook", &path);
+    append_path_targeted_menu_item(&menu, "Delete…", "app.delete-notebook", &path);
+    menu
+}
+
+fn append_path_targeted_menu_item(menu: &gio::Menu, label: &str, action: &str, path: &str) {
+    let item = gio::MenuItem::new(Some(label), None);
+    item.set_action_and_target_value(Some(action), Some(&path.to_variant()));
+    menu.append_item(&item);
+}
+
+fn update_notebook_list_selection(mode: &ViewMode, widgets: &Widgets) {
+    let _guard = widgets.notebook_events.suppress();
+    let inbox = Path::new("Inbox");
+    if let ViewMode::Notebook(path) = mode
+        && path.as_path() != inbox
+    {
+        let index = widgets
+            .notebook_rows
+            .borrow()
+            .iter()
+            .position(|candidate| candidate == path);
+        if let Some(index) = index
+            && let Some(row) = widgets.notebook_list.row_at_index(index as i32)
+        {
+            widgets.notebook_list.select_row(Some(&row));
+            return;
+        }
+    }
+    widgets.notebook_list.unselect_all();
+}
+
+/// Rebuilds the sidebar tag-filter chips from every distinct tag across
+/// `state.notes` (locked notes contribute none - their tags are always
+/// empty, see `NoteSummary::locked`).
+fn render_tags_list(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let (mut tags, active_tag): (Vec<String>, Option<String>) = {
+        let state = state.borrow();
+        let tags = state
+            .notes
+            .iter()
+            .flat_map(|summary| summary.tags.iter().cloned())
+            .collect();
+        (tags, state.filter.active_tag().map(str::to_string))
+    };
+    tags.sort_by_key(|tag| tag.to_lowercase());
+    tags.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+    let _guard = widgets.tags_events.suppress();
+    while let Some(child) = widgets.tags_flow.first_child() {
+        widgets.tags_flow.remove(&child);
+    }
+    for tag in tags {
+        let button = gtk::ToggleButton::with_label(&tag);
+        button.add_css_class("tag-filter-chip");
+        button.set_active(active_tag.as_deref() == Some(tag.as_str()));
+        let state = state.clone();
+        let widgets_for_click = widgets.clone();
+        let tag_for_click = tag.clone();
+        button.connect_toggled(move |button| {
+            if widgets_for_click.tags_events.is_suppressed() {
+                return;
+            }
+            {
+                let mut state = state.borrow_mut();
+                if button.is_active() {
+                    state.filter.set_active_tag(Some(tag_for_click.clone()));
+                } else {
+                    state.filter.clear();
+                }
+            }
+            render_note_list(&state, &widgets_for_click);
+            render_tags_list(&state, &widgets_for_click);
+        });
+        widgets.tags_flow.insert(&button, -1);
+    }
+}
+
+/// Opens a small text-entry dialog to create a notebook. `parent` is the
+/// notebook it will be nested under, or `None` for a new top-level notebook.
+fn present_new_notebook_dialog(
+    parent: Option<PathBuf>,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+) {
+    let heading = if parent.is_some() {
+        "New Child Notebook"
+    } else {
+        "New Notebook"
+    };
+    let state = state.clone();
+    let widgets_for_create = widgets.clone();
+    present_text_entry_dialog(
+        &widgets.window,
+        heading,
+        "",
+        "Notebook name",
+        "",
+        "Create",
+        move |name| {
+            let Some(name) = name else {
+                return;
+            };
+            let Ok(name) = senatorial_notes::paths::validate_notebook_name(&name) else {
+                widgets_for_create
+                    .save_status
+                    .set_label("Notebook names can't be empty or contain a path separator.");
+                return;
+            };
+            let vault = { state.borrow().vault.clone() };
+            let Some(vault) = vault else {
+                return;
+            };
+            let relative = parent.map_or_else(|| PathBuf::from(&name), |parent| parent.join(&name));
+            match vault.create_notebook(&relative) {
+                Ok(_) => {
+                    render_notebook_list(&state, &widgets_for_create);
+                    widgets_for_create.save_status.set_label("Notebook created");
+                }
+                Err(error) => widgets_for_create
+                    .save_status
+                    .set_label(&format!("Could not create notebook: {error}")),
+            }
+        },
+    );
+}
+
+fn present_rename_notebook_dialog(
+    relative: PathBuf,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+) {
+    let current_name = relative
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let state = state.clone();
+    let widgets_for_rename = widgets.clone();
+    let relative_for_rename = relative.clone();
+    present_text_entry_dialog(
+        &widgets.window,
+        "Rename Notebook",
+        "",
+        "Notebook name",
+        &current_name,
+        "Rename",
+        move |name| {
+            let Some(name) = name else {
+                return;
+            };
+            // Flush any pending edit to the OLD path first: every descendant
+            // note's path is about to change, and a stray autosave/title-
+            // commit timer must never fire against a path that is about to
+            // vanish out from under it.
+            if !persist_active(&state, &widgets_for_rename, true) {
+                return;
+            }
+            let vault = { state.borrow().vault.clone() };
+            let Some(vault) = vault else {
+                return;
+            };
+            match vault.rename_notebook(&relative_for_rename, &name) {
+                Ok(next_relative) => {
+                    let was_active_view = {
+                        state.borrow().flow.view()
+                            == &ViewMode::Notebook(relative_for_rename.clone())
+                    };
+                    if was_active_view {
+                        state
+                            .borrow_mut()
+                            .flow
+                            .switch_view(ViewMode::Notebook(next_relative.clone()));
+                    }
+                    // The active note's own path is not covered by the
+                    // scan-and-merge in `refresh_after_watcher` unless it is
+                    // passed as `preserve_active_id` - do that whenever the
+                    // active note is inside the renamed notebook (or one of
+                    // its descendants), so its relative_path is corrected
+                    // without its in-memory title/body draft being clobbered
+                    // by the rescan.
+                    let affected_active_id = {
+                        let state = state.borrow();
+                        state.active.as_ref().and_then(|active| {
+                            active
+                                .note()
+                                .relative_path
+                                .starts_with(&relative_for_rename)
+                                .then(|| active.id())
+                        })
+                    };
+                    refresh_after_watcher(&state, &widgets_for_rename, affected_active_id);
+                    refresh_watch_baseline(&state);
+                    render_notebook_list(&state, &widgets_for_rename);
+                    let mode = { state.borrow().flow.view().clone() };
+                    apply_view_chrome(&mode, &widgets_for_rename);
+                    widgets_for_rename.save_status.set_label("Notebook renamed");
+                }
+                Err(error) => widgets_for_rename
+                    .save_status
+                    .set_label(&format!("Could not rename notebook: {error}")),
+            }
+        },
+    );
+}
+
+fn confirm_delete_notebook(relative: PathBuf, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let name = relative
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("this notebook");
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message(format!("Delete the notebook \"{name}\"?"))
+        .detail("This only works if the notebook is completely empty. Move, archive, or delete its notes first.")
+        .buttons(["Cancel", "Delete"])
+        .cancel_button(0)
+        .default_button(0)
+        .build();
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let parent = widgets.window.clone();
+    dialog.choose(Some(&parent), None::<&gio::Cancellable>, move |result| {
+        if result != Ok(1) {
+            return;
+        }
+        let vault = { state.borrow().vault.clone() };
+        let Some(vault) = vault else {
+            return;
+        };
+        match vault.delete_notebook(&relative) {
+            Ok(()) => {
+                render_notebook_list(&state, &widgets);
+                widgets.save_status.set_label("Notebook deleted");
+            }
+            Err(error) => widgets
+                .save_status
+                .set_label(&format!("Could not delete notebook: {error}")),
+        }
+    });
+}
+
 fn select_row_target(target: RowTarget, widgets: &Widgets) {
     let Some(index) = widgets.selection.index_of(target) else {
         return;
@@ -2060,6 +2850,43 @@ fn selected_row_target(widgets: &Widgets) -> Option<RowTarget> {
         .and_then(|row| widgets.selection.target_at(row.index()))
 }
 
+/// Moves the list selection by `direction` rows (`1` for next, `-1` for
+/// previous) and loads whatever it lands on. Works for both the note list
+/// and Trash, since it only depends on `widgets.selection`/`RowTarget`. If
+/// nothing is selected yet, selects the first row instead of moving.
+fn select_adjacent_note(direction: i32, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let target =
+        match selected_row_target(widgets).and_then(|target| widgets.selection.index_of(target)) {
+            Some(current_index) => {
+                let next_index = current_index as i32 + direction;
+                usize::try_from(next_index)
+                    .ok()
+                    .and_then(|index| widgets.selection.target_at(index as i32))
+            }
+            None => widgets.selection.target_at(0),
+        };
+    let Some(target) = target else {
+        return;
+    };
+    select_row_target(target, widgets);
+    match target {
+        RowTarget::Note(id) => load_note_by_id(id, state, widgets),
+        RowTarget::Trash(id) => show_trash_by_id(id, state, widgets),
+    }
+}
+
+/// The note the keyboard-driven Pin/Archive/Note Information actions should
+/// act on: the currently open note, or - for a locked encrypted note, which
+/// is never `active` - whatever is selected in the list.
+fn current_note_id(state: &Rc<RefCell<AppState>>) -> Option<Uuid> {
+    let state = state.borrow();
+    state
+        .active
+        .as_ref()
+        .map(ActiveDocument::id)
+        .or_else(|| state.flow.selected_note())
+}
+
 fn select_adjacent_after_removal(
     removed_index: usize,
     state: &Rc<RefCell<AppState>>,
@@ -2079,20 +2906,33 @@ fn select_adjacent_after_removal(
     };
     select_row_target(target, widgets);
     match target {
-        RowTarget::Note(id) => load_note_by_id(id, state, widgets),
+        RowTarget::Note(id) => select_note_without_prompting_if_locked(id, state, widgets),
         RowTarget::Trash(id) => show_trash_by_id(id, state, widgets),
     }
 }
 
-fn note_row(
-    title_text: &str,
-    preview_text: &str,
+struct NoteRowSpec<'a> {
+    title: &'a str,
+    preview: &'a str,
     encrypted: bool,
     pinned: bool,
+    archived: bool,
     density: NoteListDensity,
+}
+
+fn note_row(
+    spec: NoteRowSpec<'_>,
     menu: gio::Menu,
     row_menu: &gtk::PopoverMenu,
 ) -> (gtk::ListBoxRow, RowWidgets) {
+    let NoteRowSpec {
+        title: title_text,
+        preview: preview_text,
+        encrypted,
+        pinned,
+        archived,
+        density,
+    } = spec;
     let row_content = gtk::Box::new(gtk::Orientation::Vertical, 4);
     row_content.add_css_class("note-card");
     let vertical_margin = match density {
@@ -2116,6 +2956,11 @@ fn note_row(
     pin.set_visible(pinned);
     pin.set_tooltip_text(Some("Pinned note"));
     title_row.append(&pin);
+    let archived_icon = gtk::Image::from_icon_name("folder-symbolic");
+    archived_icon.set_pixel_size(14);
+    archived_icon.set_visible(archived);
+    archived_icon.set_tooltip_text(Some("Archived note"));
+    title_row.append(&archived_icon);
     let title = gtk::Label::new(Some(title_text));
     title.set_xalign(0.0);
     title.set_hexpand(true);
@@ -2173,11 +3018,12 @@ fn note_row(
             title,
             preview,
             pin,
+            archived: archived_icon,
         },
     )
 }
 
-fn note_context_menu(id: Uuid, pinned: bool, encrypted: bool) -> gio::Menu {
+fn note_context_menu(id: Uuid, pinned: bool, archived: bool, encrypted: bool) -> gio::Menu {
     let menu = gio::Menu::new();
     append_targeted_menu_item(&menu, "Rename", "app.context-rename", id);
     append_targeted_menu_item(
@@ -2186,9 +3032,22 @@ fn note_context_menu(id: Uuid, pinned: bool, encrypted: bool) -> gio::Menu {
         "app.context-toggle-pin",
         id,
     );
+    append_targeted_menu_item(
+        &menu,
+        if archived { "Unarchive" } else { "Archive" },
+        "app.context-toggle-archived",
+        id,
+    );
+    append_targeted_menu_item(
+        &menu,
+        "Move to Notebook…",
+        "app.context-move-to-notebook",
+        id,
+    );
     if !encrypted {
         append_targeted_menu_item(&menu, "Encrypt Note…", "app.context-encrypt", id);
     }
+    append_targeted_menu_item(&menu, "Note Information", "app.context-note-info", id);
     append_targeted_menu_item(&menu, "Move to Trash", "app.context-move-to-trash", id);
     menu
 }
@@ -2206,33 +3065,60 @@ fn trash_context_menu(id: Uuid) -> gio::Menu {
 }
 
 fn append_targeted_menu_item(menu: &gio::Menu, label: &str, action: &str, id: Uuid) {
-    use gtk::glib::variant::ToVariant;
-
     let item = gio::MenuItem::new(Some(label), None);
     item.set_action_and_target_value(Some(action), Some(&id.to_string().to_variant()));
     menu.append_item(&item);
 }
 
+/// Notes visible for the currently active view, tag filter, and search
+/// query, in the user's chosen sort order. Handles every `ViewMode` that
+/// shows notes (everything but `Trash`, which has its own list and its own
+/// `filtered_trash`).
 fn filtered_notes(state: &AppState, query: &str) -> Vec<NoteSummary> {
-    state
+    let view = state.flow.view();
+    let tag = state.filter.active_tag();
+    let mut notes: Vec<NoteSummary> = state
         .notes
         .iter()
+        .filter(|summary| view_includes(view, summary))
+        .filter(|summary| {
+            tag.is_none_or(|tag| {
+                summary
+                    .tags
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(tag))
+            })
+        })
         .filter(|summary| summary_matches(summary, query))
         .cloned()
-        .collect()
+        .collect();
+    if matches!(view, ViewMode::RecentlyEdited) {
+        // Recency defines this smart view regardless of the user's general
+        // sort preference elsewhere.
+        sort_notes(&mut notes, Some(SortOrder::LastEdited));
+    } else {
+        sort_notes(&mut notes, state.config.sort_order);
+    }
+    notes
 }
 
-fn filtered_inbox(state: &AppState, query: &str) -> Vec<NoteSummary> {
-    filtered_notes(state, query)
-        .into_iter()
-        .filter(|summary| {
-            summary
-                .relative_path
-                .components()
-                .next()
-                .is_some_and(|component| component.as_os_str() == "Inbox")
-        })
-        .collect()
+/// Whether `summary` belongs in `view`. Every "day-to-day" view except
+/// Archive excludes archived notes; Recently Edited additionally excludes a
+/// currently-locked note, since SenatorialNotes cannot truthfully claim to
+/// know its edit recency without decrypting it (`NoteSummary::locked`).
+/// Notebook membership is exact - a notebook shows only notes directly
+/// inside it, never descendants of nested notebooks.
+fn view_includes(view: &ViewMode, summary: &NoteSummary) -> bool {
+    match view {
+        ViewMode::AllNotes => !summary.archived,
+        ViewMode::Notebook(path) => {
+            !summary.archived && summary.relative_path.parent() == Some(path.as_path())
+        }
+        ViewMode::Pinned => !summary.archived && summary.pinned,
+        ViewMode::RecentlyEdited => !summary.archived && !summary.locked,
+        ViewMode::Archive => summary.archived,
+        ViewMode::Trash => false,
+    }
 }
 
 fn filtered_trash(state: &AppState, query: &str) -> Vec<TrashEntry> {
@@ -2274,8 +3160,8 @@ fn show_trash_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) 
 }
 
 fn move_selected_to_trash(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
-    let view = { state.borrow().flow.view() };
-    if !matches!(view, ViewMode::Notes | ViewMode::Inbox) {
+    let is_trash_view = { state.borrow().flow.view() == &ViewMode::Trash };
+    if is_trash_view {
         return;
     }
     let id = selected_row_target(widgets)
@@ -2370,7 +3256,214 @@ fn rename_note_by_id(
     }
 }
 
-fn toggle_pin_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+/// Moves a note into `destination` and keeps every runtime structure keyed
+/// by its old path coherent - see the "Notebook move/rename runtime state"
+/// audit this follows: flush any pending edit *before* the filesystem move
+/// (so a stray autosave timer can never fire against the vanished old path
+/// and recreate it), then rebind `relative_path` everywhere it is cached, in
+/// one place, immediately after. Works identically for plaintext and
+/// encrypted notes - `Vault::move_note` never touches file content.
+fn move_note_by_id(id: Uuid, destination: &Path, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    if !persist_active(state, widgets, true) {
+        return;
+    }
+    let (vault, relative) = {
+        let state = state.borrow();
+        (
+            state.vault.clone(),
+            state
+                .notes
+                .iter()
+                .find(|summary| summary.id == id)
+                .map(|summary| summary.relative_path.clone()),
+        )
+    };
+    let (Some(vault), Some(relative)) = (vault, relative) else {
+        return;
+    };
+    match vault.move_note(&relative, destination) {
+        Ok(next_relative) => {
+            {
+                let mut state = state.borrow_mut();
+                if let Some(active) = state.active.as_mut()
+                    && active.id() == id
+                {
+                    active.note_mut().relative_path = next_relative.clone();
+                }
+                if let Some((note, _stamp)) = state.plain_cache.get_mut(&id) {
+                    note.relative_path = next_relative.clone();
+                }
+                if let Some(document) = state.unlocked_cache.get_mut(&id) {
+                    document.note_mut().relative_path = next_relative.clone();
+                }
+                if let Some(summary) = state.notes.iter_mut().find(|summary| summary.id == id) {
+                    summary.relative_path = next_relative.clone();
+                }
+            }
+            refresh_watch_baseline(state);
+            let still_visible = {
+                let state = state.borrow();
+                state
+                    .notes
+                    .iter()
+                    .find(|summary| summary.id == id)
+                    .is_some_and(|summary| view_includes(state.flow.view(), summary))
+            };
+            if still_visible {
+                render_note_list(state, widgets);
+            } else {
+                let was_selected = selected_row_target(widgets) == Some(RowTarget::Note(id));
+                let removed_index = remove_row_target(RowTarget::Note(id), widgets);
+                if was_selected && let Some(index) = removed_index {
+                    select_adjacent_after_removal(index, state, widgets);
+                }
+            }
+            widgets.save_status.set_label("Moved");
+        }
+        Err(error) => widgets
+            .save_status
+            .set_label(&format!("Could not move note: {error}")),
+    }
+}
+
+/// A small controlled window listing every notebook so the user can move a
+/// note into one. Reuses the same "SenatorialNotes-controlled window, never
+/// a self-closing dialog" convention as the password prompts.
+fn present_move_to_notebook_dialog(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let vault = { state.borrow().vault.clone() };
+    let Some(vault) = vault else {
+        return;
+    };
+    let notebooks = match vault.list_notebooks() {
+        Ok(notebooks) => notebooks,
+        Err(error) => {
+            widgets
+                .save_status
+                .set_label(&format!("Could not list notebooks: {error}"));
+            return;
+        }
+    };
+
+    let window = adw::Window::builder()
+        .transient_for(&widgets.window)
+        .modal(true)
+        .default_width(320)
+        .default_height(400)
+        .title("Move to Notebook")
+        .build();
+    close_on_escape(&window);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let header = adw::HeaderBar::new();
+    header.set_show_end_title_buttons(false);
+    let cancel = gtk::Button::with_label("Cancel");
+    header.pack_start(&cancel);
+    content.append(&header);
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("boxed-list");
+    list.set_margin_start(12);
+    list.set_margin_end(12);
+    list.set_margin_top(12);
+    list.set_margin_bottom(12);
+    let mut destinations = Vec::with_capacity(notebooks.len());
+    for notebook in &notebooks {
+        let depth = notebook
+            .relative_path
+            .components()
+            .count()
+            .saturating_sub(1);
+        // Reuses the same Inbox -> "Unfiled" display mapping as the
+        // sidebar/Note Information panel, so this list never shows the raw
+        // on-disk "Inbox" name.
+        let name = ViewMode::Notebook(notebook.relative_path.clone()).heading();
+        let row = gtk::ListBoxRow::new();
+        row.set_activatable(true);
+        let label = gtk::Label::new(Some(&format!("{}{}", "    ".repeat(depth), name)));
+        label.set_xalign(0.0);
+        label.set_margin_top(8);
+        label.set_margin_bottom(8);
+        label.set_margin_start(8);
+        label.set_margin_end(8);
+        row.set_child(Some(&label));
+        list.append(&row);
+        destinations.push(notebook.relative_path.clone());
+    }
+    {
+        let state = state.clone();
+        let widgets_for_row = widgets.clone();
+        let window_for_row = window.clone();
+        list.connect_row_activated(move |_, row| {
+            let Some(destination) = destinations.get(row.index() as usize) else {
+                return;
+            };
+            move_note_by_id(id, destination, &state, &widgets_for_row);
+            window_for_row.close();
+        });
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&list)
+        .build();
+    content.append(&scroll);
+    window.set_content(Some(&content));
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    window.present();
+}
+
+/// A protected boolean note field that can be toggled either while the note
+/// is the open/unlocked active document, or directly on disk for a
+/// background *plaintext* note (never for a background locked encrypted one
+/// - see `toggle_note_flag`).
+#[derive(Clone, Copy)]
+enum NoteFlag {
+    Pinned,
+    Archived,
+}
+
+impl NoteFlag {
+    fn get(self, metadata: &NoteMetadata) -> bool {
+        match self {
+            Self::Pinned => metadata.pinned,
+            Self::Archived => metadata.archived,
+        }
+    }
+
+    fn set(self, metadata: &mut NoteMetadata, value: bool) {
+        match self {
+            Self::Pinned => metadata.pinned = value,
+            Self::Archived => metadata.archived = value,
+        }
+    }
+
+    fn action_name(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned",
+            Self::Archived => "archived",
+        }
+    }
+
+    fn status_labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Pinned => ("Pinned", "Unpinned"),
+            Self::Archived => ("Archived", "Unarchived"),
+        }
+    }
+}
+
+/// Toggles `flag` on a note.
+///
+/// A background (not currently open) **plaintext** note is toggled directly
+/// via a load/save round trip, matching how rename/pin already worked in
+/// v0.1. A **locked** encrypted note is refused outright - `pinned` and
+/// `archived` both live inside the encrypted payload, so changing either
+/// without the password would require either a plaintext side channel (not
+/// acceptable) or guessing (not acceptable either); the note must be
+/// unlocked first. An **unlocked** encrypted note (the active document) is
+/// toggled in memory and re-encrypted through the normal save path, exactly
+/// like a plaintext note.
+fn toggle_note_flag(flag: NoteFlag, id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     if !persist_active(state, widgets, true) {
         return;
     }
@@ -2390,9 +3483,10 @@ fn toggle_pin_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) 
     };
 
     if summary.encrypted && !active_is_target {
-        widgets
-            .save_status
-            .set_label("Unlock this encrypted note before changing its pinned state.");
+        widgets.save_status.set_label(&format!(
+            "Unlock this encrypted note before changing its {} state.",
+            flag.action_name()
+        ));
         return;
     }
 
@@ -2400,8 +3494,9 @@ fn toggle_pin_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) 
         {
             let mut state = state.borrow_mut();
             if let Some(active) = state.active.as_mut() {
-                let note = active.note_mut();
-                note.metadata.pinned = !note.metadata.pinned;
+                let metadata = &mut active.note_mut().metadata;
+                let next = !flag.get(metadata);
+                flag.set(metadata, next);
                 state.body_dirty = true;
             }
         }
@@ -2409,7 +3504,8 @@ fn toggle_pin_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) 
     } else {
         match vault.load_note(&summary.relative_path) {
             Ok((mut note, stamp)) => {
-                note.metadata.pinned = !note.metadata.pinned;
+                let next = !flag.get(&note.metadata);
+                flag.set(&mut note.metadata, next);
                 match vault.save_note(&mut note, Some(&stamp)) {
                     Ok(_) => {
                         let updated = NoteSummary::from(&note);
@@ -2424,17 +3520,19 @@ fn toggle_pin_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) 
                         true
                     }
                     Err(error) => {
-                        widgets
-                            .save_status
-                            .set_label(&format!("Could not change pinned state: {error}"));
+                        widgets.save_status.set_label(&format!(
+                            "Could not change {} state: {error}",
+                            flag.action_name()
+                        ));
                         false
                     }
                 }
             }
             Err(error) => {
-                widgets
-                    .save_status
-                    .set_label(&format!("Could not open note for pinning: {error}"));
+                widgets.save_status.set_label(&format!(
+                    "Could not open note to change its {}: {error}",
+                    flag.action_name()
+                ));
                 false
             }
         }
@@ -2445,13 +3543,8 @@ fn toggle_pin_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) 
     }
     {
         let mut state = state.borrow_mut();
-        state.notes.sort_by(|left, right| {
-            right
-                .pinned
-                .cmp(&left.pinned)
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-                .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
-        });
+        let sort_order = state.config.sort_order;
+        sort_notes(&mut state.notes, sort_order);
     }
     let updated = {
         state
@@ -2462,10 +3555,25 @@ fn toggle_pin_by_id(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) 
             .cloned()
     };
     if let Some(updated) = updated {
-        replace_note_row(&updated, state, widgets);
+        let now_set = match flag {
+            NoteFlag::Pinned => updated.pinned,
+            NoteFlag::Archived => updated.archived,
+        };
+        let visible_in_current_view = { view_includes(state.borrow().flow.view(), &updated) };
+        if visible_in_current_view {
+            replace_note_row(&updated, state, widgets);
+        } else {
+            let was_selected = selected_row_target(widgets) == Some(RowTarget::Note(id));
+            let removed_index = remove_row_target(RowTarget::Note(id), widgets);
+            if was_selected && let Some(index) = removed_index {
+                select_adjacent_after_removal(index, state, widgets);
+            }
+        }
+        let (on_label, off_label) = flag.status_labels();
         widgets
             .save_status
-            .set_label(if updated.pinned { "Pinned" } else { "Unpinned" });
+            .set_label(if now_set { on_label } else { off_label });
+        render_tags_list(state, widgets);
     }
 }
 
@@ -2635,6 +3743,54 @@ fn clear_editor(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     widgets.title.set_text("");
     set_buffer_text_silently(&widgets.buffer, "");
     widgets.document_stack.set_visible_child_name("empty");
+    widgets.tags_row.set_visible(false);
+}
+
+/// Adds a tag to the currently active note. Requires a note to be open (and,
+/// for an encrypted note, unlocked - `state.active` only ever holds
+/// decrypted content), matching the same "must be unlocked" rule already
+/// enforced for pin/archive (see `toggle_note_flag`); there is no path from
+/// here to a locked note's protected metadata.
+fn add_tag_to_active_note(tag: &str, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let trimmed = tag.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let added = {
+        let mut state = state.borrow_mut();
+        let Some(active) = state.active.as_mut() else {
+            return;
+        };
+        let added = active.note_mut().metadata.add_tag(trimmed);
+        if added {
+            state.body_dirty = true;
+        }
+        added
+    };
+    if added && persist_active(state, widgets, false) {
+        render_active_tags(state, widgets);
+        update_active_summary(state, widgets);
+        render_tags_list(state, widgets);
+    }
+}
+
+fn remove_tag_from_active_note(tag: &str, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let removed = {
+        let mut state = state.borrow_mut();
+        let Some(active) = state.active.as_mut() else {
+            return;
+        };
+        let removed = active.note_mut().metadata.remove_tag(tag);
+        if removed {
+            state.body_dirty = true;
+        }
+        removed
+    };
+    if removed && persist_active(state, widgets, false) {
+        render_active_tags(state, widgets);
+        update_active_summary(state, widgets);
+        render_tags_list(state, widgets);
+    }
 }
 
 fn install_list_delete_key(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
@@ -2642,8 +3798,8 @@ fn install_list_delete_key(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     let state = state.clone();
     let widgets_for_key = widgets.clone();
     controller.connect_key_pressed(move |_, key, _, _| {
-        let view = { state.borrow().flow.view() };
-        if key == gdk::Key::Delete && matches!(view, ViewMode::Notes | ViewMode::Inbox) {
+        let is_trash_view = { state.borrow().flow.view() == &ViewMode::Trash };
+        if key == gdk::Key::Delete && !is_trash_view {
             move_selected_to_trash(&state, &widgets_for_key);
             glib::Propagation::Stop
         } else {
@@ -2800,7 +3956,7 @@ fn refresh_after_watcher(
         let state = state.borrow();
         (
             state.vault.clone(),
-            state.flow.view(),
+            state.flow.view().clone(),
             widgets.search.text().to_string(),
         )
     };
@@ -2808,64 +3964,6 @@ fn refresh_after_watcher(
         return;
     };
     match mode {
-        ViewMode::Notes | ViewMode::Inbox => {
-            let Ok(mut scanned) = vault.scan_notes() else {
-                widgets
-                    .save_status
-                    .set_label("Notes changed on disk, but the updated list could not be read.");
-                return;
-            };
-            let pin_changes = {
-                let mut state = state.borrow_mut();
-                let previous = std::mem::take(&mut state.notes);
-                let mut merged = Vec::with_capacity(scanned.len());
-                let mut pin_changes = Vec::new();
-                for old in previous {
-                    if let Some(index) = scanned.iter().position(|new| new.id == old.id) {
-                        let new = scanned.remove(index);
-                        if old.pinned != new.pinned {
-                            pin_changes.push(new.id);
-                        }
-                        if preserve_active_id == Some(old.id) {
-                            merged.push(old);
-                        } else {
-                            merged.push(new);
-                        }
-                    }
-                }
-                merged.extend(scanned);
-                state.notes = merged;
-                pin_changes
-            };
-            let (targets, summaries) = {
-                let state = state.borrow();
-                let summaries = match mode {
-                    ViewMode::Inbox => filtered_inbox(&state, &query),
-                    ViewMode::Notes | ViewMode::Trash => filtered_notes(&state, &query),
-                };
-                let targets = summaries
-                    .iter()
-                    .map(|summary| RowTarget::Note(summary.id))
-                    .collect::<Vec<_>>();
-                (targets, summaries)
-            };
-            if targets != widgets.selection.rows() {
-                render_note_list(state, widgets);
-                return;
-            }
-            for summary in summaries {
-                if pin_changes.contains(&summary.id) {
-                    replace_note_row(&summary, state, widgets);
-                    continue;
-                }
-                let row_widgets = { widgets.row_widgets.borrow().get(&summary.id).cloned() };
-                if let Some(row_widgets) = row_widgets {
-                    row_widgets.title.set_label(&summary.title);
-                    row_widgets.preview.set_label(&summary.preview);
-                    row_widgets.pin.set_visible(summary.pinned);
-                }
-            }
-        }
         ViewMode::Trash => {
             let Ok(mut scanned) = vault.scan_trash() else {
                 widgets
@@ -2904,6 +4002,69 @@ fn refresh_after_watcher(
                     };
                     row_widgets.title.set_label(&entry.title);
                     row_widgets.preview.set_label(&subtitle);
+                }
+            }
+        }
+        _ => {
+            let Ok(mut scanned) = vault.scan_notes() else {
+                widgets
+                    .save_status
+                    .set_label("Notes changed on disk, but the updated list could not be read.");
+                return;
+            };
+            let flag_changes = {
+                let mut state = state.borrow_mut();
+                let previous = std::mem::take(&mut state.notes);
+                let mut merged = Vec::with_capacity(scanned.len());
+                let mut flag_changes = Vec::new();
+                for old in previous {
+                    if let Some(index) = scanned.iter().position(|new| new.id == old.id) {
+                        let new = scanned.remove(index);
+                        if old.pinned != new.pinned || old.archived != new.archived {
+                            flag_changes.push(new.id);
+                        }
+                        if preserve_active_id == Some(old.id) {
+                            // Keep the in-memory title/body the user may be
+                            // editing, but always take the freshly scanned
+                            // location - a notebook rename must never leave
+                            // the active note's own summary pointing at a
+                            // path that no longer exists on disk.
+                            let mut preserved = old;
+                            preserved.relative_path = new.relative_path;
+                            merged.push(preserved);
+                        } else {
+                            merged.push(new);
+                        }
+                    }
+                }
+                merged.extend(scanned);
+                state.notes = merged;
+                flag_changes
+            };
+            let (targets, summaries) = {
+                let state = state.borrow();
+                let summaries = filtered_notes(&state, &query);
+                let targets = summaries
+                    .iter()
+                    .map(|summary| RowTarget::Note(summary.id))
+                    .collect::<Vec<_>>();
+                (targets, summaries)
+            };
+            if targets != widgets.selection.rows() {
+                render_note_list(state, widgets);
+                return;
+            }
+            for summary in summaries {
+                if flag_changes.contains(&summary.id) {
+                    replace_note_row(&summary, state, widgets);
+                    continue;
+                }
+                let row_widgets = { widgets.row_widgets.borrow().get(&summary.id).cloned() };
+                if let Some(row_widgets) = row_widgets {
+                    row_widgets.title.set_label(&summary.title);
+                    row_widgets.preview.set_label(&summary.preview);
+                    row_widgets.pin.set_visible(summary.pinned);
+                    row_widgets.archived.set_visible(summary.archived);
                 }
             }
         }
@@ -2968,9 +4129,11 @@ fn lock_all_encrypted(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     if !persist_active(state, widgets, true) {
         return;
     }
+    let mut newly_locked: Vec<(Uuid, PathBuf)> = Vec::new();
     {
         let mut state = state.borrow_mut();
-        for (_, mut document) in state.unlocked_cache.drain() {
+        for (id, mut document) in state.unlocked_cache.drain() {
+            newly_locked.push((id, document.note().relative_path.clone()));
             document.clear_sensitive();
         }
     }
@@ -2985,6 +4148,7 @@ fn lock_all_encrypted(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
         {
             let mut state = state.borrow_mut();
             if let Some(mut active) = state.active.take() {
+                newly_locked.push((active.id(), active.note().relative_path.clone()));
                 active.clear_sensitive();
             }
             state.last_sensitive_activity = None;
@@ -2994,6 +4158,50 @@ fn lock_all_encrypted(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
         set_buffer_text_silently(&widgets.buffer, "");
         show_locked_placeholder(widgets);
         widgets.save_status.set_label("Locked · encrypted at rest");
+    }
+    if newly_locked.is_empty() {
+        return;
+    }
+    // A locked note's protected metadata (pinned/archived/recency) is no
+    // longer known - reset every summary this call locked back to the exact
+    // same non-committal placeholder a fresh scan would produce, so nothing
+    // that was true a moment ago is still displayed as true. See the "Locked
+    // encrypted notes" note in SECURITY.md.
+    let mut locked_titles = std::collections::HashMap::new();
+    {
+        let mut state = state.borrow_mut();
+        for (id, relative_path) in &newly_locked {
+            if let Some(summary) = state.notes.iter_mut().find(|summary| summary.id == *id) {
+                *summary = NoteSummary::locked(*id, relative_path.clone());
+                locked_titles.insert(*id, summary.title.clone());
+            }
+        }
+    }
+    let must_rebuild = matches!(
+        state.borrow().flow.view(),
+        ViewMode::Pinned | ViewMode::Archive | ViewMode::RecentlyEdited
+    );
+    if must_rebuild {
+        // The note no longer qualifies for a protected-field smart view
+        // (unknown now defaults to false), so it must actually leave the
+        // list, not just have its row relabeled.
+        render_note_list(state, widgets);
+    } else {
+        for (id, _) in &newly_locked {
+            let row_widgets = { widgets.row_widgets.borrow().get(id).cloned() };
+            if let Some(row_widgets) = row_widgets {
+                // Reuse the exact label `NoteSummary::locked` just computed
+                // above (its anonymous, UUID-derived suffix) rather than a
+                // bare "Locked Note" literal, so this row stays
+                // distinguishable from every other locked note in the list.
+                if let Some(title) = locked_titles.get(id) {
+                    row_widgets.title.set_label(title);
+                }
+                row_widgets.preview.set_label("Encrypted — unlock to view");
+                row_widgets.pin.set_visible(false);
+                row_widgets.archived.set_visible(false);
+            }
+        }
     }
 }
 
@@ -3372,6 +4580,104 @@ fn present_password_dialog<F>(
     window.present();
 }
 
+/// A small controlled window collecting one line of text (a notebook name),
+/// following the same "never a self-closing dialog" convention as
+/// `present_password_dialog`.
+fn present_text_entry_dialog<F>(
+    parent: &ApplicationWindow,
+    heading: &str,
+    body: &str,
+    placeholder: &str,
+    initial_value: &str,
+    confirm_label: &str,
+    callback: F,
+) where
+    F: FnOnce(Option<String>) + 'static,
+{
+    let window = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title(heading)
+        .default_width(380)
+        .resizable(false)
+        .build();
+    let header = adw::HeaderBar::new();
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
+    let cancel = gtk::Button::with_label("Cancel");
+    let confirm = gtk::Button::with_label(confirm_label);
+    confirm.add_css_class("suggested-action");
+    header.pack_start(&cancel);
+    header.pack_end(&confirm);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    if !body.is_empty() {
+        let body_label = gtk::Label::new(Some(body));
+        body_label.set_wrap(true);
+        body_label.set_xalign(0.0);
+        content.append(&body_label);
+    }
+    let entry = gtk::Entry::builder()
+        .placeholder_text(placeholder)
+        .text(initial_value)
+        .build();
+    content.append(&entry);
+    let error = gtk::Label::new(None);
+    error.add_css_class("error");
+    error.set_wrap(true);
+    error.set_xalign(0.0);
+    error.set_visible(false);
+    content.append(&error);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&content));
+    window.set_content(Some(&toolbar));
+    window.set_default_widget(Some(&confirm));
+
+    let callback = Rc::new(RefCell::new(Some(callback)));
+    finish_on_close(&window, &callback);
+    close_on_escape(&window);
+    {
+        let window = window.clone();
+        let callback = callback.clone();
+        cancel.connect_clicked(move |_| {
+            let completion = take_completion(&callback);
+            window.close();
+            if let Some(completion) = completion {
+                completion(None);
+            }
+        });
+    }
+    {
+        let window = window.clone();
+        let callback = callback.clone();
+        let entry_for_submit = entry.clone();
+        let submit: Rc<dyn Fn()> = Rc::new(move || {
+            let value = entry_for_submit.text().to_string();
+            if value.trim().is_empty() {
+                show_dialog_error(&error, "Enter a name.");
+                return;
+            }
+            let completion = take_completion(&callback);
+            if let Some(completion) = completion {
+                window.close();
+                completion(Some(value));
+            }
+        });
+        confirm.connect_clicked({
+            let submit = submit.clone();
+            move |_| submit()
+        });
+        entry.connect_activate(move |_| submit());
+    }
+    window.present();
+}
+
 fn present_change_password_dialog<F>(parent: &ApplicationWindow, callback: F)
 where
     F: FnOnce(Option<(Zeroizing<String>, Zeroizing<String>)>) + 'static,
@@ -3487,9 +4793,9 @@ where
     window.present();
 }
 
-fn finish_on_close<F>(window: &adw::Window, callback: &Rc<RefCell<Option<F>>>)
+fn finish_on_close<T, F>(window: &adw::Window, callback: &Rc<RefCell<Option<F>>>)
 where
-    F: FnOnce(Option<Zeroizing<String>>) + 'static,
+    F: FnOnce(Option<T>) + 'static,
 {
     let callback = callback.clone();
     window.connect_close_request(move |_| {
@@ -3612,6 +4918,189 @@ fn connect_theme_updates(widgets: &Widgets) {
     adw::StyleManager::default().connect_dark_notify(move |manager| {
         update_editor_scheme(&buffer, manager.is_dark());
     });
+}
+
+/// Shows title/notebook/tags/timestamps/pinned/archived/encryption/word-and-
+/// character-count/vault-relative-path for the currently open (or, for a
+/// locked encrypted note, currently selected) note, with the UUID tucked
+/// into an "Advanced" expander out of the normal reading flow. A locked
+/// note shows only what a locked `NoteSummary` actually knows - never a
+/// guess at its protected fields (see the "Locked encrypted notes" note in
+/// `SECURITY.md`).
+fn present_note_info_dialog(id: Uuid, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let summary = {
+        state
+            .borrow()
+            .notes
+            .iter()
+            .find(|summary| summary.id == id)
+            .cloned()
+    };
+    let Some(summary) = summary else {
+        return;
+    };
+    // A primitive-only snapshot, not a clone of the whole `Note` - the same
+    // discipline `update_active_summary` already uses, so this dialog does
+    // not keep an extra long-lived copy of decrypted content around.
+    let active_snapshot = {
+        state.borrow().active.as_ref().and_then(|active| {
+            (active.id() == id).then(|| {
+                let note = active.note();
+                (
+                    note.metadata.title.clone(),
+                    note.relative_path.clone(),
+                    note.metadata.tags.clone(),
+                    note.metadata.created_at,
+                    note.metadata.updated_at,
+                    note.metadata.pinned,
+                    note.metadata.archived,
+                    note.body.split_whitespace().count(),
+                    note.body.chars().count(),
+                    active.is_encrypted(),
+                )
+            })
+        })
+    };
+
+    let window = ApplicationWindow::builder()
+        .transient_for(&widgets.window)
+        .modal(true)
+        .title("Note Information")
+        .default_width(380)
+        .default_height(if active_snapshot.is_some() { 580 } else { 260 })
+        .build();
+    {
+        let target = window.clone();
+        let controller = gtk::EventControllerKey::new();
+        controller.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                target.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        window.add_controller(controller);
+    }
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&adw::HeaderBar::new());
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
+    content.set_margin_top(14);
+    content.set_margin_bottom(20);
+
+    match active_snapshot {
+        None => {
+            let notice = gtk::Label::new(Some(
+                "This note is encrypted and locked. Unlock it to see its details.",
+            ));
+            notice.set_wrap(true);
+            notice.set_xalign(0.0);
+            content.append(&notice);
+            content.append(&preference_row(
+                "Encryption",
+                &gtk::Label::new(Some("Encrypted · locked")),
+            ));
+            content.append(&info_advanced_expander(&summary.relative_path, id));
+        }
+        Some((
+            title,
+            relative_path,
+            tags,
+            created_at,
+            updated_at,
+            pinned,
+            archived,
+            words,
+            characters,
+            encrypted,
+        )) => {
+            content.append(&preference_row("Title", &gtk::Label::new(Some(&title))));
+            // Reuses `ViewMode::heading`'s Inbox -> "Unfiled" display mapping
+            // so this panel never shows the raw on-disk "Inbox" name the
+            // sidebar no longer does.
+            let notebook = relative_path
+                .parent()
+                .map(|parent| ViewMode::Notebook(parent.to_path_buf()).heading())
+                .unwrap_or_else(|| ViewMode::Notebook(PathBuf::from("Inbox")).heading());
+            content.append(&preference_row(
+                "Notebook",
+                &gtk::Label::new(Some(&notebook)),
+            ));
+            let tags = if tags.is_empty() {
+                "None".to_string()
+            } else {
+                tags.join(", ")
+            };
+            content.append(&preference_row("Tags", &gtk::Label::new(Some(&tags))));
+            content.append(&preference_row(
+                "Created",
+                &gtk::Label::new(Some(&format_timestamp(created_at))),
+            ));
+            content.append(&preference_row(
+                "Modified",
+                &gtk::Label::new(Some(&format_timestamp(updated_at))),
+            ));
+            content.append(&preference_row(
+                "Pinned",
+                &gtk::Label::new(Some(if pinned { "Yes" } else { "No" })),
+            ));
+            content.append(&preference_row(
+                "Archived",
+                &gtk::Label::new(Some(if archived { "Yes" } else { "No" })),
+            ));
+            content.append(&preference_row(
+                "Encryption",
+                &gtk::Label::new(Some(if encrypted {
+                    "Encrypted · unlocked"
+                } else {
+                    "Not encrypted"
+                })),
+            ));
+            content.append(&preference_row(
+                "Word count",
+                &gtk::Label::new(Some(&words.to_string())),
+            ));
+            content.append(&preference_row(
+                "Character count",
+                &gtk::Label::new(Some(&characters.to_string())),
+            ));
+            content.append(&info_advanced_expander(&relative_path, id));
+        }
+    }
+
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&content)
+        .build();
+    root.append(&scroll);
+    window.set_content(Some(&root));
+    window.present();
+}
+
+/// The note's vault-relative location and UUID, tucked into a collapsed
+/// expander since they matter far less often than the fields above it.
+fn info_advanced_expander(relative_path: &Path, id: Uuid) -> gtk::Expander {
+    let details = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    details.set_margin_top(8);
+    let location = gtk::Label::new(Some(&relative_path.display().to_string()));
+    location.set_wrap(true);
+    location.set_xalign(0.0);
+    details.append(&preference_row("Location in vault", &location));
+    let uuid_label = gtk::Label::new(Some(&id.to_string()));
+    uuid_label.set_selectable(true);
+    uuid_label.set_xalign(0.0);
+    details.append(&preference_row("UUID", &uuid_label));
+    let expander = gtk::Expander::new(Some("Advanced"));
+    expander.set_child(Some(&details));
+    expander
+}
+
+fn format_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.format("%Y-%m-%d %H:%M UTC").to_string()
 }
 
 fn show_preferences(application: &Application, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
@@ -4008,6 +5497,99 @@ fn install_actions(
     application.add_action(&focus_search);
     application.set_accels_for_action("app.focus-search", &["<Primary><Shift>f"]);
 
+    let focus_note_list = gio::SimpleAction::new("focus-note-list", None);
+    {
+        let note_list = widgets.note_list.clone();
+        focus_note_list.connect_activate(move |_, _| {
+            note_list.grab_focus();
+        });
+    }
+    application.add_action(&focus_note_list);
+    application.set_accels_for_action("app.focus-note-list", &["<Primary>1"]);
+
+    let focus_editor = gio::SimpleAction::new("focus-editor", None);
+    {
+        let editor = widgets.editor.clone();
+        focus_editor.connect_activate(move |_, _| {
+            editor.grab_focus();
+        });
+    }
+    application.add_action(&focus_editor);
+    application.set_accels_for_action("app.focus-editor", &["<Primary>2"]);
+
+    let next_note = gio::SimpleAction::new("next-note", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        next_note.connect_activate(move |_, _| select_adjacent_note(1, &state, &widgets));
+    }
+    application.add_action(&next_note);
+    // Not <Alt>Down: GtkSourceView already binds Alt+Up/Down to its own
+    // move-lines action, so a global accelerator there would only fire when
+    // focus happens to be outside the editor - confusing and inconsistent.
+    application.set_accels_for_action("app.next-note", &["<Primary>bracketright"]);
+
+    let previous_note = gio::SimpleAction::new("previous-note", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        previous_note.connect_activate(move |_, _| select_adjacent_note(-1, &state, &widgets));
+    }
+    application.add_action(&previous_note);
+    application.set_accels_for_action("app.previous-note", &["<Primary>bracketleft"]);
+
+    let toggle_pin = gio::SimpleAction::new("toggle-pin", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        toggle_pin.connect_activate(move |_, _| {
+            if let Some(id) = current_note_id(&state) {
+                toggle_note_flag(NoteFlag::Pinned, id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&toggle_pin);
+    application.set_accels_for_action("app.toggle-pin", &["<Primary><Shift>p"]);
+
+    let toggle_archived = gio::SimpleAction::new("toggle-archived", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        toggle_archived.connect_activate(move |_, _| {
+            if let Some(id) = current_note_id(&state) {
+                toggle_note_flag(NoteFlag::Archived, id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&toggle_archived);
+    application.set_accels_for_action("app.toggle-archived", &["<Primary><Shift>a"]);
+
+    let note_info = gio::SimpleAction::new("note-info", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        note_info.connect_activate(move |_, _| {
+            if let Some(id) = current_note_id(&state) {
+                present_note_info_dialog(id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&note_info);
+    application.set_accels_for_action("app.note-info", &["<Alt>Return"]);
+
+    let context_note_info =
+        gio::SimpleAction::new("context-note-info", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        context_note_info.connect_activate(move |_, parameter| {
+            if let Some(id) = uuid_parameter(parameter) {
+                present_note_info_dialog(id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&context_note_info);
+
     let move_to_trash = gio::SimpleAction::new("move-to-trash", None);
     {
         let state = state.clone();
@@ -4112,11 +5694,123 @@ fn install_actions(
         let widgets = widgets.clone();
         context_toggle_pin.connect_activate(move |_, parameter| {
             if let Some(id) = uuid_parameter(parameter) {
-                toggle_pin_by_id(id, &state, &widgets);
+                toggle_note_flag(NoteFlag::Pinned, id, &state, &widgets);
             }
         });
     }
     application.add_action(&context_toggle_pin);
+
+    let context_toggle_archived =
+        gio::SimpleAction::new("context-toggle-archived", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        context_toggle_archived.connect_activate(move |_, parameter| {
+            if let Some(id) = uuid_parameter(parameter) {
+                toggle_note_flag(NoteFlag::Archived, id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&context_toggle_archived);
+
+    let context_move_to_notebook =
+        gio::SimpleAction::new("context-move-to-notebook", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        context_move_to_notebook.connect_activate(move |_, parameter| {
+            if let Some(id) = uuid_parameter(parameter) {
+                present_move_to_notebook_dialog(id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&context_move_to_notebook);
+
+    let new_child_notebook =
+        gio::SimpleAction::new("new-child-notebook", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        new_child_notebook.connect_activate(move |_, parameter| {
+            if let Some(path) = parameter.and_then(|value| value.str()) {
+                present_new_notebook_dialog(Some(PathBuf::from(path)), &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&new_child_notebook);
+
+    let rename_notebook_action =
+        gio::SimpleAction::new("rename-notebook", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        rename_notebook_action.connect_activate(move |_, parameter| {
+            if let Some(path) = parameter.and_then(|value| value.str()) {
+                present_rename_notebook_dialog(PathBuf::from(path), &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&rename_notebook_action);
+
+    let delete_notebook_action =
+        gio::SimpleAction::new("delete-notebook", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        delete_notebook_action.connect_activate(move |_, parameter| {
+            if let Some(path) = parameter.and_then(|value| value.str()) {
+                confirm_delete_notebook(PathBuf::from(path), &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&delete_notebook_action);
+
+    let new_notebook = gio::SimpleAction::new("new-notebook", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        new_notebook.connect_activate(move |_, _| {
+            present_new_notebook_dialog(None, &state, &widgets);
+        });
+    }
+    application.add_action(&new_notebook);
+    application.set_accels_for_action("app.new-notebook", &["<Primary><Shift>n"]);
+
+    let initial_sort_target = match state.borrow().config.sort_order {
+        Some(SortOrder::LastEdited) | None => "last-edited",
+        Some(SortOrder::DateCreated) => "date-created",
+        Some(SortOrder::TitleAsc) => "title-asc",
+        Some(SortOrder::TitleZa) => "title-za",
+    };
+    let set_sort_order = gio::SimpleAction::new_stateful(
+        "set-sort-order",
+        Some(glib::VariantTy::STRING),
+        &initial_sort_target.to_variant(),
+    );
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        set_sort_order.connect_activate(move |action, parameter| {
+            let Some(target) = parameter.and_then(|value| value.str()) else {
+                return;
+            };
+            let order = match target {
+                "last-edited" => SortOrder::LastEdited,
+                "date-created" => SortOrder::DateCreated,
+                "title-asc" => SortOrder::TitleAsc,
+                "title-za" => SortOrder::TitleZa,
+                _ => return,
+            };
+            action.set_state(&target.to_variant());
+            {
+                let mut state = state.borrow_mut();
+                state.config.sort_order = Some(order);
+                let _ = state.config.save();
+            }
+            render_note_list(&state, &widgets);
+        });
+    }
+    application.add_action(&set_sort_order);
 
     let context_encrypt = gio::SimpleAction::new("context-encrypt", Some(glib::VariantTy::STRING));
     {
@@ -4327,6 +6021,322 @@ fn char_to_byte(value: &str, char_index: usize) -> usize {
 
 fn byte_to_char(value: &str, byte_index: usize) -> usize {
     value[..byte_index.min(value.len())].chars().count()
+}
+
+// --- Editor V2: live-preview Markdown rendering ---------------------------
+//
+// The GtkSourceView buffer holds literal Markdown at all times, exactly as
+// it always has - saving, loading, undo/redo, and encryption are completely
+// unaffected by anything below. This is a purely presentational layer: a
+// debounced pass reads the buffer's text, asks `markdown_spans` what should
+// be styled, and applies a fixed set of `GtkTextTag`s. Marker punctuation is
+// dimmed, never hidden - Stage C.0 found that `GtkTextTag:invisible` crashes
+// GTK4's own text b-tree when combined with programmatic cursor movement
+// (see the plan/completion report), so this design uses no invisible text,
+// no custom cursor handling, and no buffer transformation of any kind.
+
+const MARKDOWN_MARKER_TAG: &str = "md-marker";
+const MARKDOWN_STYLE_TAGS: &[&str] = &[
+    "md-h1",
+    "md-h2",
+    "md-h3",
+    "md-bold",
+    "md-italic",
+    "md-strike",
+    "md-highlight",
+    "md-code",
+    "md-codeblock",
+    "md-quote",
+    "md-link",
+    "md-checked",
+];
+
+/// Registers the fixed tag set once, at buffer construction. Every property
+/// used here is purely visual (weight, style, scale, colour, strikethrough,
+/// underline, margin) - never `invisible`. Marker punctuation is dimmed by
+/// reducing the alpha of an otherwise mid-grey foreground, which reads as
+/// "muted" against both light and dark themes without hardcoding a colour
+/// that would look wrong in one of them.
+fn register_markdown_style_tags(buffer: &sourceview5::Buffer) {
+    let table = buffer.tag_table();
+
+    let marker = gtk::TextTag::builder().name(MARKDOWN_MARKER_TAG).build();
+    marker.set_foreground_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.6)));
+    table.add(&marker);
+
+    let h1 = gtk::TextTag::builder()
+        .name("md-h1")
+        .weight(700)
+        .scale(1.42)
+        .build();
+    table.add(&h1);
+    let h2 = gtk::TextTag::builder()
+        .name("md-h2")
+        .weight(700)
+        .scale(1.24)
+        .build();
+    table.add(&h2);
+    let h3 = gtk::TextTag::builder()
+        .name("md-h3")
+        .weight(700)
+        .scale(1.1)
+        .build();
+    table.add(&h3);
+    let bold = gtk::TextTag::builder().name("md-bold").weight(700).build();
+    table.add(&bold);
+    let italic = gtk::TextTag::builder()
+        .name("md-italic")
+        .style(gtk::pango::Style::Italic)
+        .build();
+    table.add(&italic);
+    let strike = gtk::TextTag::builder()
+        .name("md-strike")
+        .strikethrough(true)
+        .build();
+    table.add(&strike);
+    let highlight = gtk::TextTag::builder().name("md-highlight").build();
+    highlight.set_background_rgba(Some(&gdk::RGBA::new(0.95, 0.83, 0.25, 0.35)));
+    table.add(&highlight);
+    let code = gtk::TextTag::builder()
+        .name("md-code")
+        .family("monospace")
+        .build();
+    code.set_background_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.16)));
+    table.add(&code);
+    let code_block = gtk::TextTag::builder()
+        .name("md-codeblock")
+        .family("monospace")
+        .build();
+    code_block.set_background_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.16)));
+    table.add(&code_block);
+    let quote = gtk::TextTag::builder()
+        .name("md-quote")
+        .style(gtk::pango::Style::Italic)
+        .left_margin(16)
+        .build();
+    quote.set_foreground_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.85)));
+    table.add(&quote);
+    let link = gtk::TextTag::builder()
+        .name("md-link")
+        .underline(gtk::pango::Underline::Single)
+        .build();
+    link.set_foreground_rgba(Some(&gdk::RGBA::new(0.32, 0.5, 0.86, 1.0)));
+    table.add(&link);
+    let checked = gtk::TextTag::builder()
+        .name("md-checked")
+        .strikethrough(true)
+        .build();
+    checked.set_foreground_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.85)));
+    table.add(&checked);
+}
+
+fn content_tag_names(kind: SpanKind) -> &'static [&'static str] {
+    match kind {
+        SpanKind::Heading1 => &["md-h1"],
+        SpanKind::Heading2 => &["md-h2"],
+        SpanKind::Heading3 => &["md-h3"],
+        SpanKind::Bold => &["md-bold"],
+        SpanKind::Italic => &["md-italic"],
+        SpanKind::Strikethrough => &["md-strike"],
+        SpanKind::Highlight => &["md-highlight"],
+        SpanKind::InlineCode => &["md-code"],
+        SpanKind::CodeBlock => &["md-codeblock"],
+        SpanKind::Quote => &["md-quote"],
+        SpanKind::Link => &["md-link"],
+        SpanKind::ChecklistItem { checked: true } => &["md-checked"],
+        SpanKind::ChecklistItem { checked: false }
+        | SpanKind::BulletItem
+        | SpanKind::NumberedItem
+        | SpanKind::Divider => &[],
+    }
+}
+
+/// Recomputes every Markdown style tag over the whole buffer. Whole-buffer
+/// rather than incrementally invalidated on purpose: a delimiter change can
+/// affect styling beyond the edit point, and a stale tag is worse than a
+/// slightly wider recompute. Only ever calls `apply_tag_by_name`/
+/// `remove_tag_by_name` - GTK documents `changed` as firing for content
+/// changes and `apply-tag`/`remove-tag` as separate signals with their own
+/// default handlers, and the modified bit likewise only tracks content
+/// edits, so this can never mark the buffer modified, trigger autosave, or
+/// create an undo step for the user's actual text.
+fn recompute_markdown_styles(buffer: &sourceview5::Buffer) {
+    let start = buffer.start_iter();
+    let end = buffer.end_iter();
+    let text = buffer.text(&start, &end, true).to_string();
+
+    let clear_start = buffer.start_iter();
+    let clear_end = buffer.end_iter();
+    buffer.remove_tag_by_name(MARKDOWN_MARKER_TAG, &clear_start, &clear_end);
+    for tag in MARKDOWN_STYLE_TAGS {
+        buffer.remove_tag_by_name(tag, &clear_start, &clear_end);
+    }
+
+    for span in markdown_spans::compute_spans(&text) {
+        for marker in &span.marker_ranges {
+            apply_tag_range(buffer, MARKDOWN_MARKER_TAG, &text, marker.clone());
+        }
+        for tag in content_tag_names(span.kind) {
+            apply_tag_range(buffer, tag, &text, span.content_range.clone());
+        }
+    }
+}
+
+fn apply_tag_range(
+    buffer: &sourceview5::Buffer,
+    tag: &str,
+    text: &str,
+    range: std::ops::Range<usize>,
+) {
+    if range.start >= range.end {
+        return;
+    }
+    let start_char = byte_to_char(text, range.start) as i32;
+    let end_char = byte_to_char(text, range.end) as i32;
+    let start_iter = buffer.iter_at_offset(start_char);
+    let end_iter = buffer.iter_at_offset(end_char);
+    buffer.apply_tag_by_name(tag, &start_iter, &end_iter);
+}
+
+/// Debounces a style recompute after a real text edit. A short delay -
+/// quick enough to feel immediate, long enough that fast typing does not
+/// trigger a rescan on every keystroke.
+fn schedule_style_recompute(widgets: &Widgets) {
+    if let Some(source) = widgets.style_recompute_source.borrow_mut().take() {
+        source.remove();
+    }
+    let buffer = widgets.buffer.clone();
+    let source_slot = widgets.style_recompute_source.clone();
+    let source = glib::timeout_add_local_once(Duration::from_millis(120), move || {
+        source_slot.borrow_mut().take();
+        recompute_markdown_styles(&buffer);
+    });
+    *widgets.style_recompute_source.borrow_mut() = Some(source);
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ActiveFormats {
+    bold: bool,
+    italic: bool,
+}
+
+/// Determines which formats the toolbar should show as active, following
+/// the agreed rules precisely rather than a naive tag check at the raw
+/// cursor offset:
+///
+/// - A non-empty selection: active only if the format applies uniformly
+///   across the *entire* selection (the same rule `toggle_wrap` in
+///   `formatting.rs` already uses to decide "already applied").
+/// - No selection: the character immediately *before* the cursor
+///   (left-gravity, matching GTK's own `insert_at_cursor` tag-inheritance
+///   convention), falling back to the character immediately after only at
+///   the very start of a line/buffer.
+/// - An empty paragraph has no tagged character to inspect either way, so
+///   it always reads as inactive here; a future "sticky" toolbar state
+///   would be separate, explicit UI state, not something inferred from
+///   absent tags.
+/// - Always re-derived from the buffer's current tags, including after
+///   undo/redo - no separate toolbar state can desync from the buffer.
+fn active_formats_at(buffer: &sourceview5::Buffer) -> ActiveFormats {
+    if let Some((start, end)) = buffer.selection_bounds() {
+        return ActiveFormats {
+            bold: tag_covers_range(buffer, "md-bold", &start, &end),
+            italic: tag_covers_range(buffer, "md-italic", &start, &end),
+        };
+    }
+    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+    let probe = if cursor.starts_line() {
+        cursor
+    } else {
+        let mut before = cursor;
+        before.backward_char();
+        before
+    };
+    ActiveFormats {
+        bold: probe.has_tag(&tag_by_name(buffer, "md-bold")),
+        italic: probe.has_tag(&tag_by_name(buffer, "md-italic")),
+    }
+}
+
+fn tag_by_name(buffer: &sourceview5::Buffer, name: &str) -> gtk::TextTag {
+    buffer
+        .tag_table()
+        .lookup(name)
+        .unwrap_or_else(|| gtk::TextTag::builder().name(name).build())
+}
+
+fn tag_covers_range(
+    buffer: &sourceview5::Buffer,
+    name: &str,
+    start: &gtk::TextIter,
+    end: &gtk::TextIter,
+) -> bool {
+    let tag = tag_by_name(buffer, name);
+    let mut probe = *start;
+    while probe < *end {
+        if !probe.has_tag(&tag) {
+            return false;
+        }
+        if !probe.forward_char() {
+            break;
+        }
+    }
+    true
+}
+
+/// Reflects `active_formats_at` on the Bold/Italic toolbar buttons via the
+/// existing theme/accent-aware `brand-accent` CSS class, not
+/// `GtkToggleButton` state - the buttons are also wired to
+/// `app.format-bold`/`app.format-italic` via `set_action_name`, and a
+/// toggle button's own click-driven active state would fight this external,
+/// cursor-position-driven one. Only touches a button's CSS class when its
+/// state actually changed since the last call, so a burst of
+/// same-formatting cursor moves does not repeatedly toggle the same class.
+fn update_format_toolbar_state(widgets: &Widgets) {
+    let formats = active_formats_at(&widgets.buffer);
+    if formats == widgets.format_toolbar_state.get() {
+        return;
+    }
+    widgets.format_toolbar_state.set(formats);
+    for (button, active) in [
+        (&widgets.format_bold_button, formats.bold),
+        (&widgets.format_italic_button, formats.italic),
+    ] {
+        if active {
+            button.add_css_class("brand-accent");
+        } else {
+            button.remove_css_class("brand-accent");
+        }
+    }
+}
+
+/// Defers `update_format_toolbar_state` to an idle callback - i.e. the next
+/// point the main loop is otherwise free - rather than running it inline.
+///
+/// `cursor-position` is a GObject property notify, and GObject property
+/// notifications are always synchronous: connecting this handler directly
+/// to `connect_cursor_position_notify` would run it nested inside whatever
+/// call moved the cursor, which very much includes `GtkTextBuffer::delete`/
+/// `insert` while `apply_format_to_buffer` is still on the stack for a
+/// formatting action. Mutating unrelated widgets (the toolbar buttons' CSS
+/// classes, which can trigger their own style/layout invalidation) from
+/// that deeply re-entrant a point risks exactly the kind of "widget touched
+/// mid-relayout" bug this project's RefCell-reentrancy discipline exists to
+/// prevent, just at the GTK-widget-tree level instead of the Rust-borrow
+/// level. Deferring to idle guarantees the update always runs as its own
+/// clean top-level main loop turn, after the triggering call has fully
+/// returned and any layout that call queued has had a chance to settle.
+fn schedule_format_toolbar_update(widgets: &Widgets) {
+    if let Some(source) = widgets.format_toolbar_update_source.borrow_mut().take() {
+        source.remove();
+    }
+    let widgets_for_update = widgets.clone();
+    let source_slot = widgets.format_toolbar_update_source.clone();
+    let source = glib::idle_add_local_once(move || {
+        source_slot.borrow_mut().take();
+        update_format_toolbar_state(&widgets_for_update);
+    });
+    *widgets.format_toolbar_update_source.borrow_mut() = Some(source);
 }
 
 fn show_welcome_error(widgets: &Widgets, message: &str) {
