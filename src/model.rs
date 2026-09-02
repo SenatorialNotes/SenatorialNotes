@@ -19,6 +19,11 @@ pub struct NoteMetadata {
     pub tags: Vec<String>,
     #[serde(default)]
     pub pinned: bool,
+    /// A note the user marked as a favourite. Independent of [`pinned`]: a note
+    /// can be neither, either, or both. Additive front-matter field - an older
+    /// build round-trips it through [`unknown`].
+    #[serde(default)]
+    pub favourite: bool,
     #[serde(default)]
     pub archived: bool,
     #[serde(flatten)]
@@ -35,6 +40,7 @@ impl NoteMetadata {
             updated_at: now,
             tags: Vec::new(),
             pinned: false,
+            favourite: false,
             archived: false,
             unknown: BTreeMap::new(),
         }
@@ -180,6 +186,9 @@ pub struct NoteSummary {
     pub tags: Vec<String>,
     pub encrypted: bool,
     pub pinned: bool,
+    /// Whether the note is a favourite. `false` for a locked encrypted note
+    /// (a protected field - never guessed while locked), like `pinned`.
+    pub favourite: bool,
     /// Whether the note is archived. For a locked encrypted note this is
     /// always `false`: the real value lives inside the encrypted payload and
     /// SenatorialNotes never guesses or leaks it while locked. See
@@ -215,6 +224,7 @@ impl From<&Note> for NoteSummary {
             tags: note.metadata.tags.clone(),
             encrypted: false,
             pinned: note.metadata.pinned,
+            favourite: note.metadata.favourite,
             archived: note.metadata.archived,
             locked: false,
         }
@@ -261,6 +271,7 @@ impl NoteSummary {
             tags: Vec::new(),
             encrypted: true,
             pinned: false,
+            favourite: false,
             archived: false,
             locked: true,
         }

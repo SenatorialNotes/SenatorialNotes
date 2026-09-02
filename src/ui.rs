@@ -10,18 +10,26 @@ use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
 use gtk::glib::variant::ToVariant;
-use senatorial_notes::config::{Accent, AppConfig, NoteListDensity, SortOrder, Theme};
+use senatorial_notes::config::{
+    Accent, AppConfig, NoteListDensity, SortOrder, Theme, VaultSessionState,
+};
 use senatorial_notes::constants::{APP_ID, APP_NAME, MIN_PASSWORD_LENGTH, PRIVACY_STATEMENT};
+use senatorial_notes::crypto::vault::{self as vault_crypto, VaultKeys};
 use senatorial_notes::formatting::{FormatAction, apply_markdown_format};
 use senatorial_notes::markdown_spans::{self, SpanKind};
 use senatorial_notes::search::summary_matches;
 use senatorial_notes::sort::sort_notes;
 use senatorial_notes::ui_state::{
-    FilterState, RowTarget, SelectionCoordinator, SelectionIntent, UiFlow, ViewMode,
+    FilterState, RowTarget, SelectionCoordinator, SelectionIntent, SessionRegistry, UiFlow,
+    ViewMode,
+};
+use senatorial_notes::vault_lock::{
+    BlockedReason, DeadReason, LockAcquisition, LockStatus, VaultLock,
 };
 use senatorial_notes::watcher::VaultWatcher;
 use senatorial_notes::{
     EncryptedSession, FileStamp, Note, NoteMetadata, NoteSummary, NotebookEntry, TrashEntry, Vault,
+    VaultKind, paths,
 };
 use sourceview5::prelude::*;
 use uuid::Uuid;
@@ -96,7 +104,22 @@ struct AppState {
     title_draft: String,
     flow: UiFlow,
     filter: FilterState,
+    /// Working copy of the currently open vault's per-vault session state
+    /// (last note, last view, recently-opened notes, editor scroll). Loaded
+    /// on vault open - from the app config for a Standard Vault, from the
+    /// sealed manifest for a Secure Vault - updated as the user views notes,
+    /// and persisted on leave / lock. `recently_opened` powers the "Recently
+    /// Opened" smart view.
+    session: VaultSessionState,
     last_sensitive_activity: Option<Instant>,
+    /// Mirrors `Vault::is_read_only()` for the currently open vault, cached so
+    /// the UI can gate mutation controls without holding the `Vault`.
+    read_only: bool,
+    /// The advisory lock for the currently open vault. A writable session owns
+    /// it (dropping it releases the lock file); a read-only session holds a
+    /// non-owning `VaultLock::read_only()` handle. `None` before any vault is
+    /// open.
+    vault_lock: Option<VaultLock>,
 }
 
 /// Upper bound on cached clean plaintext documents. Notes are small, but this
@@ -114,6 +137,7 @@ struct RowWidgets {
     title: gtk::Label,
     preview: gtk::Label,
     pin: gtk::Image,
+    favourite: gtk::Image,
     archived: gtk::Image,
 }
 
@@ -150,7 +174,41 @@ struct Widgets {
     window: ApplicationWindow,
     stack: gtk::Stack,
     welcome_status: gtk::Label,
+    /// Vault name shown in the header switcher button.
     vault_label: gtk::Label,
+    /// Session generation for the currently open vault. Every vault open/switch
+    /// bumps it; a deferred callback armed under an older generation becomes
+    /// inert (see [`SessionRegistry`] and `open_vault`).
+    sessions: Rc<SessionRegistry>,
+    /// The header multi-vault control's popover (current vault identity +
+    /// Open Vault… + Open Recent).
+    vault_popover: gtk::Popover,
+    vault_popover_name: gtk::Label,
+    vault_popover_path: gtk::Label,
+    /// Read-only / migration-warning line inside the popover; hidden when empty.
+    vault_popover_status: gtk::Label,
+    /// Rebuilt list of recent-vault rows inside the popover.
+    vault_recent_box: gtk::Box,
+    /// Secure-Vault-only actions in the popover (Lock Vault, Change Vault
+    /// Password…). Hidden for a Standard Vault or a locked Secure Vault.
+    vault_popover_secure_actions: gtk::Box,
+    /// Lock glyph in the header button, visible only for a read-only vault.
+    vault_readonly_icon: gtk::Image,
+    /// Padlock glyph before the vault name: closed while a Secure Vault is
+    /// locked, open while unlocked. Hidden for a Standard Vault.
+    vault_state_icon: gtk::Image,
+    /// Header "Lock Vault" button. Locks the whole Secure Vault (distinct from
+    /// the per-note lock). Visible only for an unlocked Secure Vault.
+    vault_lock_button: gtk::Button,
+    /// Recent-vault list on the welcome screen (hidden when there are none).
+    welcome_recent_box: gtk::Box,
+    welcome_recent_heading: gtk::Label,
+    /// One-time first-run panel on the welcome screen.
+    first_run_panel: gtk::Box,
+    /// Header mutation controls, kept so `apply_read_only_ui` can disable them.
+    new_note: gtk::Button,
+    new_notebook: gtk::Button,
+    delete_button: gtk::Button,
     notes_heading: gtk::Label,
     search: gtk::SearchEntry,
     note_list: gtk::ListBox,
@@ -174,9 +232,13 @@ struct Widgets {
     all_notes_button: gtk::Button,
     inbox_button: gtk::Button,
     pinned_button: gtk::Button,
-    recently_edited_button: gtk::Button,
+    recently_opened_button: gtk::Button,
+    favourites_button: gtk::Button,
     archive_button: gtk::Button,
     trash_button: gtk::Button,
+    /// Rebuilt list of the user's Secure Vaults in the sidebar (bounded, with
+    /// a "More…" affordance). Filled by `render_secure_vaults_sidebar`.
+    secure_vaults_box: gtk::Box,
     /// Dynamic list of user notebooks (everything except `Inbox`, which has
     /// its own fixed sidebar row). One `gtk::ListBox` row per notebook, in
     /// the same order as `notebook_rows`.
@@ -220,7 +282,18 @@ struct Widgets {
     /// formatted text) never re-touches the buttons' CSS classes.
     format_toolbar_state: Rc<Cell<ActiveFormats>>,
     save_status: gtk::Label,
+    /// Note-header quick actions. `note_lock_button` is note-level only: it
+    /// encrypts an ordinary note, unlocks a locked encrypted note, or locks an
+    /// unlocked one - it never locks the whole Secure Vault.
+    note_lock_button: gtk::Button,
+    note_favourite_button: gtk::Button,
+    note_pin_button: gtk::Button,
+    note_overflow_button: gtk::MenuButton,
     locked_copy: gtk::Label,
+    /// Status/error line on the whole-vault lock screen.
+    vault_locked_status: gtk::Label,
+    /// "Unlock Vault" button on the whole-vault lock screen.
+    vault_unlock_button: gtk::Button,
     trash_detail_title: gtk::Label,
     empty_trash_button: gtk::Button,
     appearance_provider: gtk::CssProvider,
@@ -228,15 +301,20 @@ struct Widgets {
 
 struct Controls {
     create_vault: gtk::Button,
+    create_encrypted_vault: gtk::Button,
     open_vault: gtk::Button,
+    first_run_start: gtk::Button,
+    first_run_secure: gtk::Button,
     new_note: gtk::Button,
     new_notebook: gtk::Button,
     all_notes: gtk::Button,
     inbox: gtk::Button,
     pinned: gtk::Button,
-    recently_edited: gtk::Button,
+    recently_opened: gtk::Button,
+    favourites: gtk::Button,
     archive: gtk::Button,
     trash: gtk::Button,
+    new_secure_vault: gtk::Button,
     library_toggle: gtk::Button,
     back_to_notes: gtk::Button,
     unlock: gtk::Button,
@@ -292,8 +370,105 @@ fn build_application(application: &Application) {
         );
     }
 
-    connect_folder_button(&controls.create_vault, true, state.clone(), widgets.clone());
-    connect_folder_button(&controls.open_vault, false, state.clone(), widgets.clone());
+    connect_folder_button(
+        &controls.create_vault,
+        true,
+        state.clone(),
+        widgets.clone(),
+        pending.clone(),
+    );
+    connect_folder_button(
+        &controls.open_vault,
+        false,
+        state.clone(),
+        widgets.clone(),
+        pending.clone(),
+    );
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        controls
+            .create_encrypted_vault
+            .connect_clicked(move |_| present_encrypted_vault_creator(&state, &widgets, &pending));
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        controls.first_run_start.connect_clicked(move |_| {
+            widgets.first_run_panel.set_visible(false);
+            let main_path = { state.borrow().config.last_vault.clone() };
+            if let Some(path) = main_path {
+                open_vault(&path, false, &state, &widgets, &pending);
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        controls.first_run_secure.connect_clicked(move |_| {
+            present_managed_secure_vault_setup(&state, &widgets, &pending)
+        });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        widgets
+            .vault_unlock_button
+            .clone()
+            .connect_clicked(move |_| begin_vault_unlock(&state, &widgets, &pending));
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        widgets.vault_lock_button.clone().connect_clicked(move |_| {
+            // Vault-level lock: seals the whole Secure Vault. Never a per-note
+            // operation. `lock_vault` shows the locked-vault workspace itself.
+            lock_vault(&state, &widgets, &pending);
+        });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        widgets
+            .note_lock_button
+            .clone()
+            .connect_clicked(move |_| note_quick_lock(&state, &widgets, &pending));
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        widgets
+            .note_favourite_button
+            .clone()
+            .connect_clicked(move |_| {
+                if let Some(id) = current_note_id(&state) {
+                    toggle_note_flag(NoteFlag::Favourite, id, &state, &widgets);
+                }
+            });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        widgets.note_pin_button.clone().connect_clicked(move |_| {
+            if let Some(id) = current_note_id(&state) {
+                toggle_note_flag(NoteFlag::Pinned, id, &state, &widgets);
+            }
+        });
+    }
 
     {
         let split = widgets.library_split.clone();
@@ -369,9 +544,19 @@ fn build_application(application: &Application) {
         let state = state.clone();
         let widgets = widgets.clone();
         let pending = pending.clone();
-        controls.recently_edited.connect_clicked(move |_| {
+        controls.recently_opened.connect_clicked(move |_| {
             cancel_all_timers(&pending);
-            switch_view(ViewMode::RecentlyEdited, &state, &widgets);
+            switch_view(ViewMode::RecentlyOpened, &state, &widgets);
+        });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        controls.favourites.connect_clicked(move |_| {
+            cancel_all_timers(&pending);
+            switch_view(ViewMode::Favourites, &state, &widgets);
         });
     }
 
@@ -382,6 +567,15 @@ fn build_application(application: &Application) {
         controls.archive.connect_clicked(move |_| {
             cancel_all_timers(&pending);
             switch_view(ViewMode::Archive, &state, &widgets);
+        });
+    }
+
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        controls.new_secure_vault.connect_clicked(move |_| {
+            present_managed_secure_vault_setup(&state, &widgets, &pending)
         });
     }
 
@@ -494,13 +688,7 @@ fn build_application(application: &Application) {
                 }
                 state.title_draft = entry.text().to_string();
                 state.title_dirty = true;
-                if state
-                    .active
-                    .as_ref()
-                    .is_some_and(ActiveDocument::is_encrypted)
-                {
-                    state.last_sensitive_activity = Some(Instant::now());
-                }
+                touch_sensitive_activity(&mut state);
                 true
             };
             if !should_schedule {
@@ -615,7 +803,14 @@ fn build_application(application: &Application) {
                 source.remove();
             }
             if persist_active(&state, &widgets, true) {
+                // Persist the per-vault session (last note/view, Recently
+                // Opened) while a Secure Vault is still unlocked to seal it.
+                persist_vault_session_state(&state, &widgets);
                 clear_sensitive_documents(&state);
+                // Release the advisory vault lock cleanly on a normal exit.
+                {
+                    state.borrow_mut().vault_lock.take();
+                }
                 // Detach the shared context menu before its parent is disposed.
                 widgets.row_menu.unparent();
                 glib::Propagation::Proceed
@@ -625,15 +820,179 @@ fn build_application(application: &Application) {
         });
     }
 
-    connect_locking_events(&state, &widgets);
+    connect_locking_events(&state, &widgets, &pending);
     install_watcher_poll(&state, &widgets);
 
-    let last_vault = { state.borrow().config.last_vault.clone() };
-    if let Some(path) = last_vault.filter(|path| path.is_dir()) {
-        open_vault(&path, false, &state, &widgets);
+    // Startup. A truly fresh install (no config, no known vaults) gets a
+    // managed workspace with a ready-to-use "Main" Standard Vault created and
+    // opened automatically - the user can write a note immediately without a
+    // folder picker. Otherwise, restore the previous vault; a missing one
+    // leaves the welcome screen (never silently re-created).
+    let (is_first_run, last_vault) = {
+        let config = &state.borrow().config;
+        let fresh = !config.first_run_done
+            && config.last_vault.is_none()
+            && config.recent_vaults.is_empty();
+        (fresh, config.last_vault.clone())
+    };
+    if is_first_run {
+        run_first_run_setup(&state, &widgets, &pending);
+    } else {
+        match last_vault {
+            Some(path) if path.is_dir() => open_vault(&path, false, &state, &widgets, &pending),
+            Some(path) => {
+                show_welcome_error(
+                    &widgets,
+                    &format!(
+                        "The last vault at {} is no longer there. Open another vault to continue.",
+                        path.display()
+                    ),
+                );
+            }
+            None => {}
+        }
     }
+    // Populate the welcome-screen recent list even when no vault opened.
+    render_vault_switcher(&state, &widgets, &pending);
 
     widgets.window.present();
+}
+
+/// Builds the header vault-switcher popover shell. The current-vault labels and
+/// the recent list are filled in later by `render_vault_switcher`.
+struct VaultPopover {
+    popover: gtk::Popover,
+    name: gtk::Label,
+    path: gtk::Label,
+    status: gtk::Label,
+    recent_box: gtk::Box,
+    /// Vault-level security actions (Lock Vault, Change Vault Password…).
+    /// Shown only while the current vault is an unlocked Secure Vault - a
+    /// Standard Vault has no vault-level key to lock.
+    secure_actions: gtk::Box,
+}
+
+fn build_vault_popover() -> VaultPopover {
+    let popover = gtk::Popover::new();
+    popover.set_position(gtk::PositionType::Bottom);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_width_request(320);
+
+    let name = gtk::Label::new(None);
+    name.add_css_class("heading");
+    name.set_xalign(0.0);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    content.append(&name);
+
+    let path = gtk::Label::new(None);
+    path.add_css_class("caption");
+    path.add_css_class("dim-label");
+    path.set_xalign(0.0);
+    path.set_selectable(true);
+    path.set_wrap(true);
+    path.set_max_width_chars(40);
+    content.append(&path);
+
+    let status = gtk::Label::new(None);
+    status.add_css_class("caption");
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.set_max_width_chars(40);
+    status.set_visible(false);
+    content.append(&status);
+
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+    // Applies to any open vault. Opens the focused per-vault settings dialog
+    // (rename for a Standard Vault; auto-lock + security + rename for a Secure
+    // Vault) - never the generic Preferences window.
+    let rename_button = gtk::Button::with_label("Vault Settings…");
+    rename_button.add_css_class("flat");
+    rename_button.set_halign(gtk::Align::Start);
+    rename_button.set_tooltip_text(Some(
+        "Rename this vault (display name only) and, for a Secure Vault, its auto-lock and security options",
+    ));
+    rename_button.set_action_name(Some("app.vault-settings"));
+    content.append(&rename_button);
+
+    // Vault-level security actions - a Secure Vault only.
+    let secure_actions = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    secure_actions.set_visible(false);
+    let lock_vault_button = gtk::Button::with_label("Lock Vault");
+    lock_vault_button.add_css_class("flat");
+    lock_vault_button.set_halign(gtk::Align::Start);
+    lock_vault_button.set_tooltip_text(Some(
+        "Lock this Secure Vault and clear its notes from memory",
+    ));
+    lock_vault_button.set_action_name(Some("app.lock-vault"));
+    secure_actions.append(&lock_vault_button);
+    let change_vault_password_button = gtk::Button::with_label("Change Vault Password…");
+    change_vault_password_button.add_css_class("flat");
+    change_vault_password_button.set_halign(gtk::Align::Start);
+    change_vault_password_button.set_action_name(Some("app.change-vault-password"));
+    secure_actions.append(&change_vault_password_button);
+    let auto_lock_button = gtk::Button::with_label("Auto-Lock & Security…");
+    auto_lock_button.add_css_class("flat");
+    auto_lock_button.set_halign(gtk::Align::Start);
+    auto_lock_button.set_tooltip_text(Some(
+        "Auto-Lock, Change Vault Password and Rename for this Secure Vault",
+    ));
+    auto_lock_button.set_action_name(Some("app.vault-settings"));
+    secure_actions.append(&auto_lock_button);
+    content.append(&secure_actions);
+
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+    let open_button = gtk::Button::with_label("Open Vault…");
+    open_button.add_css_class("flat");
+    open_button.set_halign(gtk::Align::Start);
+    open_button.set_action_name(Some("app.open-vault"));
+    content.append(&open_button);
+
+    let create_button = gtk::Button::with_label("Create Vault…");
+    create_button.add_css_class("flat");
+    create_button.set_halign(gtk::Align::Start);
+    create_button.set_tooltip_text(Some("Choose a folder for a new local notes vault"));
+    create_button.set_action_name(Some("app.create-vault"));
+    content.append(&create_button);
+
+    let create_encrypted_button = gtk::Button::with_label("Create Secure Vault…");
+    create_encrypted_button.add_css_class("flat");
+    create_encrypted_button.set_halign(gtk::Align::Start);
+    create_encrypted_button.set_tooltip_text(Some(
+        "Create a vault where everything is encrypted and protected by the vault password",
+    ));
+    create_encrypted_button.set_action_name(Some("app.create-encrypted-vault"));
+    content.append(&create_encrypted_button);
+
+    let recent_heading = gtk::Label::new(Some("Open Recent"));
+    recent_heading.add_css_class("caption");
+    recent_heading.add_css_class("dim-label");
+    recent_heading.set_xalign(0.0);
+    content.append(&recent_heading);
+
+    let recent_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let recent_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .max_content_height(260)
+        .propagate_natural_height(true)
+        .child(&recent_box)
+        .build();
+    content.append(&recent_scroll);
+
+    popover.set_child(Some(&content));
+    VaultPopover {
+        popover,
+        name,
+        path,
+        status,
+        recent_box,
+        secure_actions,
+    }
 }
 
 fn build_window(application: &Application) -> (Widgets, Controls) {
@@ -700,6 +1059,33 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     encryption_copy.set_max_width_chars(66);
     encryption_copy.add_css_class("caption");
     welcome.append(&encryption_copy);
+    // First-run panel: shown once, right after the managed "Main" vault is
+    // created. Lets the user start writing immediately, or set up the Secure
+    // Vault password. Hidden on every subsequent launch.
+    let first_run_panel = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    first_run_panel.set_halign(gtk::Align::Center);
+    first_run_panel.set_visible(false);
+    let first_run_ready = gtk::Label::new(Some("Your workspace is ready."));
+    first_run_ready.add_css_class("title-3");
+    first_run_panel.append(&first_run_ready);
+    let first_run_detail = gtk::Label::new(Some(
+        "Main — standard everyday notes.\n\
+         Secure — everything inside is encrypted and protected by your Vault Password.",
+    ));
+    first_run_detail.set_justify(gtk::Justification::Center);
+    first_run_detail.set_wrap(true);
+    first_run_detail.add_css_class("dim-label");
+    first_run_panel.append(&first_run_detail);
+    let first_run_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    first_run_buttons.set_halign(gtk::Align::Center);
+    let first_run_start = gtk::Button::with_label("Start Writing");
+    first_run_start.add_css_class("suggested-action");
+    let first_run_secure = gtk::Button::with_label("Set Secure Vault Password");
+    first_run_buttons.append(&first_run_start);
+    first_run_buttons.append(&first_run_secure);
+    first_run_panel.append(&first_run_buttons);
+    welcome.append(&first_run_panel);
+
     let welcome_actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     welcome_actions.set_halign(gtk::Align::Center);
     let create_vault = gtk::Button::with_label("Create New Vault");
@@ -710,6 +1096,22 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     welcome_actions.append(&create_vault);
     welcome_actions.append(&open_vault);
     welcome.append(&welcome_actions);
+    let create_encrypted_vault = gtk::Button::with_label("Create Secure Vault…");
+    create_encrypted_vault.set_halign(gtk::Align::Center);
+    create_encrypted_vault.add_css_class("flat");
+    create_encrypted_vault.set_tooltip_text(Some(
+        "Create a vault where everything is encrypted and protected by the vault password",
+    ));
+    welcome.append(&create_encrypted_vault);
+    let welcome_recent_heading = gtk::Label::new(Some("Recent vaults"));
+    welcome_recent_heading.add_css_class("caption");
+    welcome_recent_heading.add_css_class("dim-label");
+    welcome_recent_heading.set_visible(false);
+    welcome.append(&welcome_recent_heading);
+    let welcome_recent_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    welcome_recent_box.set_visible(false);
+    welcome_recent_box.set_halign(gtk::Align::Center);
+    welcome.append(&welcome_recent_box);
     let welcome_status = gtk::Label::new(None);
     welcome_status.set_wrap(true);
     welcome_status.set_max_width_chars(66);
@@ -723,8 +1125,36 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     vault_label.add_css_class("heading");
     // The header title must not grow the window minimum for a long vault name.
     vault_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    vault_label.set_max_width_chars(24);
-    header.set_title_widget(Some(&vault_label));
+    vault_label.set_max_width_chars(20);
+    let vault_readonly_icon = gtk::Image::from_icon_name("changes-prevent-symbolic");
+    vault_readonly_icon.set_visible(false);
+    vault_readonly_icon.set_tooltip_text(Some("This vault is open read-only"));
+    // Lock-state glyph in front of the vault name: a closed padlock while a
+    // Secure Vault is locked, an open one while it is unlocked. Hidden for a
+    // Standard Vault, which is never locked.
+    let vault_state_icon = gtk::Image::from_icon_name("channel-secure-symbolic");
+    vault_state_icon.set_visible(false);
+    let vault_button_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    vault_button_box.append(&vault_readonly_icon);
+    vault_button_box.append(&vault_state_icon);
+    vault_button_box.append(&vault_label);
+    let VaultPopover {
+        popover: vault_popover,
+        name: vault_popover_name,
+        path: vault_popover_path,
+        status: vault_popover_status,
+        recent_box: vault_recent_box,
+        secure_actions: vault_popover_secure_actions,
+    } = build_vault_popover();
+    let vault_menu = gtk::MenuButton::builder()
+        .tooltip_text("Current vault — switch or open another")
+        .build();
+    vault_menu.set_child(Some(&vault_button_box));
+    vault_menu.set_popover(Some(&vault_popover));
+    vault_menu.update_property(&[gtk::accessible::Property::Label(
+        "Current vault and vault switcher",
+    )]);
+    header.set_title_widget(Some(&vault_menu));
     let library_toggle = gtk::Button::from_icon_name("sidebar-show-symbolic");
     library_toggle.set_visible(false);
     library_toggle.set_tooltip_text(Some("Show Library"));
@@ -735,6 +1165,15 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     back_to_notes.set_tooltip_text(Some("Back to note list"));
     back_to_notes.update_property(&[gtk::accessible::Property::Label("Back to note list")]);
     header.pack_start(&back_to_notes);
+    // Vault-level lock control. Distinct from the per-note lock in the note
+    // header: this locks the whole Secure Vault. Shown only for an unlocked
+    // Secure Vault; a Standard Vault never exposes it.
+    let vault_lock_button = labeled_icon_button("Lock Vault", "channel-secure-symbolic");
+    vault_lock_button.set_visible(false);
+    vault_lock_button.set_tooltip_text(Some("Lock this Secure Vault"));
+    vault_lock_button
+        .update_property(&[gtk::accessible::Property::Label("Lock this Secure Vault")]);
+    header.pack_start(&vault_lock_button);
     let new_note = labeled_icon_button("New Note", "document-new-symbolic");
     new_note.add_css_class("suggested-action");
     new_note.set_tooltip_text(Some("New note (Ctrl+N)"));
@@ -775,7 +1214,22 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     sidebar.set_margin_end(10);
     sidebar.set_margin_top(14);
     sidebar.set_margin_bottom(14);
-    let library_heading = gtk::Label::new(Some("LIBRARY"));
+
+    let app_title = gtk::Label::new(Some(APP_NAME));
+    app_title.set_xalign(0.0);
+    app_title.add_css_class("heading");
+    sidebar.append(&app_title);
+
+    // Search lives at the top of the sidebar and searches the currently open
+    // vault only (never a cross-vault search). Cleared on vault lock.
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search this vault")
+        .margin_bottom(6)
+        .build();
+    search.update_property(&[gtk::accessible::Property::Label("Search this vault")]);
+    sidebar.append(&search);
+
+    let library_heading = gtk::Label::new(Some("NOTES"));
     library_heading.set_xalign(0.0);
     library_heading.add_css_class("sidebar-section-title");
     sidebar.append(&library_heading);
@@ -783,24 +1237,34 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     all_notes.add_css_class("sidebar-selected");
     all_notes.set_tooltip_text(Some("Show every note in this vault"));
     sidebar.append(&all_notes);
-    // Displayed as "Unfiled" - the on-disk notebook directory stays named
-    // "Inbox" for backward compatibility with existing vaults; only the
-    // UI-facing label changes. See `ViewMode::heading`.
-    let inbox = sidebar_button("Unfiled", "mail-inbox-symbolic");
-    inbox.set_tooltip_text(Some("Show notes not filed into another notebook"));
-    sidebar.append(&inbox);
-    let pinned = sidebar_button("Pinned", "emblem-favorite-symbolic");
-    pinned.set_tooltip_text(Some("Show pinned notes"));
+    let recently_opened = sidebar_button("Recently Opened", "document-open-recent-symbolic");
+    recently_opened.set_tooltip_text(Some("Notes you recently opened"));
+    sidebar.append(&recently_opened);
+    let favourites = sidebar_button("Favourites", "starred-symbolic");
+    favourites.set_tooltip_text(Some("Notes you marked as a favourite"));
+    sidebar.append(&favourites);
+    let pinned = sidebar_button("Pinned", "view-pin-symbolic");
+    pinned.set_tooltip_text(Some("Pinned notes"));
     sidebar.append(&pinned);
-    let recently_edited = sidebar_button("Recently Edited", "document-open-recent-symbolic");
-    recently_edited.set_tooltip_text(Some("Show recently edited notes"));
-    sidebar.append(&recently_edited);
     let archive = sidebar_button("Archive", "folder-symbolic");
-    archive.set_tooltip_text(Some("Show archived notes"));
+    archive.set_tooltip_text(Some("Archived notes"));
     sidebar.append(&archive);
-    let trash = sidebar_button("Trash", "user-trash-symbolic");
-    trash.set_tooltip_text(Some("Show deleted notes"));
-    sidebar.append(&trash);
+
+    // "Secured Vaults" lists the user's actual Secure Vaults (whole-vault
+    // encrypted). Clicking one switches to it. It is *not* a smart view of
+    // individually encrypted notes.
+    let secured_heading = gtk::Label::new(Some("SECURED VAULTS"));
+    secured_heading.set_xalign(0.0);
+    secured_heading.set_margin_top(10);
+    secured_heading.add_css_class("sidebar-section-title");
+    sidebar.append(&secured_heading);
+    let secure_vaults_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    sidebar.append(&secure_vaults_box);
+    let new_secure_vault = sidebar_button("New Secure Vault", "list-add-symbolic");
+    new_secure_vault.set_tooltip_text(Some(
+        "Create a new Secure Vault (everything inside is encrypted and protected by a vault password)",
+    ));
+    sidebar.append(&new_secure_vault);
 
     let notebooks_header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     notebooks_header.set_margin_top(10);
@@ -815,6 +1279,13 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     notebooks_header.append(&notebooks_heading);
     notebooks_header.append(&new_notebook);
     sidebar.append(&notebooks_header);
+
+    // Displayed as "Unfiled" - the on-disk notebook directory stays named
+    // "Inbox" for backward compatibility with existing vaults; only the
+    // UI-facing label changes. See `ViewMode::heading`.
+    let inbox = sidebar_button("Unfiled", "mail-inbox-symbolic");
+    inbox.set_tooltip_text(Some("Show notes not filed into another notebook"));
+    sidebar.append(&inbox);
 
     let notebook_list = gtk::ListBox::new();
     notebook_list.set_selection_mode(gtk::SelectionMode::Single);
@@ -836,6 +1307,11 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     tags_flow.set_row_spacing(4);
     tags_flow.set_column_spacing(4);
     sidebar.append(&tags_flow);
+
+    let trash = sidebar_button("Trash", "user-trash-symbolic");
+    trash.set_margin_top(10);
+    trash.set_tooltip_text(Some("Show deleted notes"));
+    sidebar.append(&trash);
 
     let privacy_badge = gtk::Label::new(Some("Offline by design"));
     privacy_badge.set_valign(gtk::Align::End);
@@ -902,14 +1378,6 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     notes_header.append(&sort_button);
     notes_header.append(&empty_trash_button);
     notes_box.append(&notes_header);
-    let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search notes")
-        .margin_start(12)
-        .margin_end(12)
-        .margin_bottom(10)
-        .build();
-    search.update_property(&[gtk::accessible::Property::Label("Search notes")]);
-    notes_box.append(&search);
     let note_list = gtk::ListBox::new();
     note_list.set_selection_mode(gtk::SelectionMode::Single);
     note_list.add_css_class("note-list");
@@ -978,8 +1446,42 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     save_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
     save_status.set_max_width_chars(18);
     save_status.update_property(&[gtk::accessible::Property::Label("Save status")]);
+
+    // Note-header quick actions: My Note [lock] [favourite] [pin] [overflow].
+    // The lock button is note-level only and never locks the whole vault.
+    let note_lock_button = gtk::Button::from_icon_name("changes-allow-symbolic");
+    note_lock_button.add_css_class("flat");
+    note_lock_button.set_valign(gtk::Align::Center);
+    note_lock_button.set_tooltip_text(Some("Encrypt Note"));
+    note_lock_button.update_property(&[gtk::accessible::Property::Label(
+        "Encrypt, lock or unlock this note",
+    )]);
+    let note_favourite_button = gtk::Button::from_icon_name("non-starred-symbolic");
+    note_favourite_button.add_css_class("flat");
+    note_favourite_button.set_valign(gtk::Align::Center);
+    note_favourite_button.set_tooltip_text(Some("Add to Favourites"));
+    note_favourite_button.update_property(&[gtk::accessible::Property::Label(
+        "Add to or remove from Favourites",
+    )]);
+    let note_pin_button = gtk::Button::from_icon_name("view-pin-symbolic");
+    note_pin_button.add_css_class("flat");
+    note_pin_button.set_valign(gtk::Align::Center);
+    note_pin_button.set_tooltip_text(Some("Pin Note"));
+    note_pin_button.update_property(&[gtk::accessible::Property::Label("Pin or unpin this note")]);
+    let note_overflow_button = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("More note actions")
+        .build();
+    note_overflow_button.add_css_class("flat");
+    note_overflow_button.set_valign(gtk::Align::Center);
+    note_overflow_button.update_property(&[gtk::accessible::Property::Label("More note actions")]);
+
     title_row.append(&title);
     title_row.append(&save_status);
+    title_row.append(&note_lock_button);
+    title_row.append(&note_favourite_button);
+    title_row.append(&note_pin_button);
+    title_row.append(&note_overflow_button);
     editor_box.append(&title_row);
 
     let tags_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1057,6 +1559,29 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
     locked_page.append(&unlock);
     document_stack.add_named(&scroll_center(&locked_page), Some("locked"));
 
+    // Whole-vault lock screen. It lives inside the *content* area so the
+    // application shell - header, vault identity, vault switcher, sidebar -
+    // stays visible and usable while a Secure Vault is locked. The user can
+    // switch to another vault (including Main) without entering this vault's
+    // password; only this vault's decrypted content is withheld.
+    let vault_locked_page = centered_status_page(
+        "channel-secure-symbolic",
+        "Secure Vault Locked",
+        "Everything in this vault is encrypted and protected by your Vault Password.",
+    );
+    let vault_unlock_button = gtk::Button::with_label("Unlock Vault");
+    vault_unlock_button.add_css_class("suggested-action");
+    vault_unlock_button.add_css_class("pill");
+    vault_unlock_button.set_halign(gtk::Align::Center);
+    vault_locked_page.append(&vault_unlock_button);
+    let vault_locked_status = gtk::Label::new(None);
+    vault_locked_status.set_wrap(true);
+    vault_locked_status.set_max_width_chars(54);
+    vault_locked_status.set_justify(gtk::Justification::Center);
+    vault_locked_status.add_css_class("dim-label");
+    vault_locked_page.append(&vault_locked_status);
+    document_stack.add_named(&scroll_center(&vault_locked_page), Some("vault-locked"));
+
     let empty_page = centered_status_page(
         "document-new-symbolic",
         "No note selected",
@@ -1099,6 +1624,7 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
 
     workspace.append(&library_split);
     stack.add_named(&workspace, Some("workspace"));
+
     window.set_content(Some(&stack));
 
     // AdwBreakpoints on a window are mutually exclusive: only the best-matching
@@ -1143,6 +1669,22 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
             stack,
             welcome_status,
             vault_label,
+            sessions: Rc::new(SessionRegistry::default()),
+            vault_popover,
+            vault_popover_name,
+            vault_popover_path,
+            vault_popover_status,
+            vault_recent_box,
+            vault_popover_secure_actions,
+            vault_readonly_icon,
+            vault_state_icon,
+            vault_lock_button,
+            welcome_recent_box,
+            welcome_recent_heading,
+            first_run_panel,
+            new_note: new_note.clone(),
+            new_notebook: new_notebook.clone(),
+            delete_button,
             notes_heading,
             search,
             note_list,
@@ -1160,9 +1702,11 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
             all_notes_button: all_notes.clone(),
             inbox_button: inbox.clone(),
             pinned_button: pinned.clone(),
-            recently_edited_button: recently_edited.clone(),
+            recently_opened_button: recently_opened.clone(),
+            favourites_button: favourites.clone(),
             archive_button: archive.clone(),
             trash_button: trash.clone(),
+            secure_vaults_box,
             notebook_list,
             notebook_menu,
             notebook_rows: Rc::new(RefCell::new(Vec::new())),
@@ -1183,22 +1727,33 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
             format_toolbar_update_source: Rc::new(RefCell::new(None)),
             format_toolbar_state: Rc::new(Cell::new(ActiveFormats::default())),
             save_status,
+            note_lock_button,
+            note_favourite_button,
+            note_pin_button,
+            note_overflow_button,
             locked_copy,
+            vault_locked_status,
+            vault_unlock_button,
             trash_detail_title,
             empty_trash_button,
             appearance_provider,
         },
         Controls {
             create_vault,
+            create_encrypted_vault,
             open_vault,
+            first_run_start,
+            first_run_secure,
             new_note,
             new_notebook,
             all_notes,
             inbox,
             pinned,
-            recently_edited,
+            recently_opened,
+            favourites,
             archive,
             trash,
+            new_secure_vault,
             library_toggle,
             back_to_notes,
             unlock,
@@ -1210,13 +1765,36 @@ fn build_window(application: &Application) -> (Widgets, Controls) {
 
 fn application_menu() -> gio::Menu {
     let menu = gio::Menu::new();
-    menu.append(Some("Open Vault…"), Some("app.open-vault"));
+    let vaults = gio::Menu::new();
+    vaults.append(Some("Open Vault…"), Some("app.open-vault"));
+    vaults.append(Some("Create Vault…"), Some("app.create-vault"));
+    vaults.append(
+        Some("Create Secure Vault…"),
+        Some("app.create-encrypted-vault"),
+    );
+    vaults.append(Some("Vault Settings…"), Some("app.vault-settings"));
+    menu.append_section(None, &vaults);
+
+    // Secure Vault (whole-vault) actions. The actions are disabled for a
+    // Standard Vault, so "Lock Vault" cannot be invoked where there is no
+    // vault-level key.
+    let vault_security = gio::Menu::new();
+    vault_security.append(Some("Lock Vault"), Some("app.lock-vault"));
+    vault_security.append(
+        Some("Change Vault Password…"),
+        Some("app.change-vault-password"),
+    );
+    menu.append_section(Some("Secure Vault"), &vault_security);
+
     menu.append(Some("Preferences"), Some("app.preferences"));
     let security = gio::Menu::new();
     security.append(Some("Encrypt Note…"), Some("app.encrypt-note"));
-    security.append(Some("Lock Now"), Some("app.lock-now"));
-    security.append(Some("Change Password…"), Some("app.change-password"));
-    security.append(Some("Remove Encryption…"), Some("app.remove-encryption"));
+    security.append(Some("Lock Note"), Some("app.lock-note"));
+    security.append(Some("Change Note Password…"), Some("app.change-password"));
+    security.append(
+        Some("Remove Note Encryption…"),
+        Some("app.remove-encryption"),
+    );
     menu.append_section(Some("Encrypted Note"), &security);
     let note = gio::Menu::new();
     note.append(Some("Note Information"), Some("app.note-info"));
@@ -1375,106 +1953,1481 @@ fn connect_folder_button(
     create: bool,
     state: Rc<RefCell<AppState>>,
     widgets: Widgets,
+    pending: Rc<RefCell<PendingSaves>>,
 ) {
     button.connect_clicked(move |_| {
-        let dialog = gtk::FileDialog::builder()
-            .title(if create {
-                "Choose a Folder for the New Vault"
+        present_vault_folder_picker(create, &state, &widgets, &pending);
+    });
+}
+
+/// The native folder picker used by both welcome buttons and the
+/// `app.open-vault` / `app.create-vault` actions. Cancelling it is a complete
+/// no-op — the current vault/session is never touched until a folder is chosen
+/// *and* `open_vault` has validated it.
+fn present_vault_folder_picker(
+    create: bool,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    widgets.vault_popover.popdown();
+    let dialog = gtk::FileDialog::builder()
+        .title(if create {
+            "Choose a Folder for the New Vault"
+        } else {
+            "Open a SenatorialNotes Vault"
+        })
+        .modal(true)
+        .build();
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    let parent = widgets.window.clone();
+    dialog.select_folder(
+        Some(&parent),
+        None::<&gio::Cancellable>,
+        move |result| match result {
+            Ok(folder) => match folder.path() {
+                Some(path) => open_vault(&path, create, &state, &widgets, &pending),
+                None => report_vault_open_error(
+                    &state,
+                    &widgets,
+                    "The selected folder is not a local path.",
+                ),
+            },
+            Err(error) if !error.matches(gio::IOErrorEnum::Cancelled) => {
+                report_vault_open_error(
+                    &state,
+                    &widgets,
+                    &format!("Folder selection failed: {error}"),
+                );
+            }
+            Err(_) => {}
+        },
+    );
+}
+
+/// Best-effort canonical path; falls back to the path as given.
+fn canonical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Shows a vault-open failure without disturbing the current vault: on the
+/// welcome screen it uses the welcome status line, in the workspace it uses the
+/// save-status line so the open vault stays fully usable.
+fn report_vault_open_error(state: &Rc<RefCell<AppState>>, widgets: &Widgets, message: &str) {
+    if state.borrow().vault.is_some() {
+        widgets.save_status.set_label(message);
+    } else {
+        show_welcome_error(widgets, message);
+    }
+}
+
+/// Opens (or, with `create`, creates) the vault at `path` and makes it the
+/// active vault.
+///
+/// Ordering is deliberate so a failed switch never damages the current vault:
+///
+/// 1. **Validate** the target (`Vault::open`/`create`). On failure the current
+///    vault/session is completely untouched.
+/// 2. **Decide the lock**: `VaultLock::acquire`. `Free`/ours → writable.
+///    A contended lock → a modal dialog whose outcome (read-only / take over /
+///    cancel) drives the commit; failing to acquire never touches the current
+///    session.
+/// 3. In `commit_vault_switch`: flush the outgoing vault (abort on save
+///    failure), **release the old writable lock only after that flush**, bump
+///    the session generation, swap in the new vault + lock, rebuild, restore.
+fn open_vault(
+    path: &Path,
+    create: bool,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    // 1. Validate the target first. Nothing about the current session changes.
+    let vault = match if create {
+        Vault::create(path)
+    } else {
+        Vault::open(path)
+    } {
+        Ok(vault) => vault,
+        Err(error) => {
+            report_vault_open_error(
+                state,
+                widgets,
+                &format!("Could not open the vault: {error}"),
+            );
+            return;
+        }
+    };
+
+    // Re-selecting the vault that is already open: just close the popover.
+    let already_current = {
+        let state = state.borrow();
+        state
+            .vault
+            .as_ref()
+            .map(|current| canonical_path(current.root()) == canonical_path(vault.root()))
+            .unwrap_or(false)
+    };
+    if already_current {
+        widgets.vault_popover.popdown();
+        return;
+    }
+
+    // 2. Decide the lock and commit. Still nothing about the current session
+    // has changed until `commit_vault_switch` runs.
+    proceed_with_opened_vault(vault, path.to_path_buf(), state, widgets, pending);
+}
+
+/// Acquires the advisory lock for an already-validated `vault` and commits the
+/// switch (or shows the lock-contention dialog). Shared by opening an existing
+/// vault and creating a new (ordinary or encrypted) one.
+fn proceed_with_opened_vault(
+    vault: Vault,
+    path: PathBuf,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    match VaultLock::acquire(&vault) {
+        Ok(LockAcquisition::Acquired(lock)) => {
+            commit_vault_switch(vault, lock, path, state, widgets, pending);
+        }
+        Ok(LockAcquisition::Contended(_)) if vault.is_read_only() => {
+            // We were opening read-only anyway - skip the dialog.
+            commit_vault_switch(vault, VaultLock::read_only(), path, state, widgets, pending);
+        }
+        Ok(LockAcquisition::Contended(status)) => {
+            present_lock_contention_dialog(vault, status, path, state, widgets, pending);
+        }
+        Err(error) => {
+            report_vault_open_error(
+                state,
+                widgets,
+                &format!("Could not lock the vault: {error}"),
+            );
+        }
+    }
+}
+
+/// Commits a vault switch: the new `vault` is validated and its lock decided.
+/// Releases the outgoing vault's writable lock only after the outgoing vault
+/// has been safely flushed.
+fn commit_vault_switch(
+    vault: Vault,
+    lock: VaultLock,
+    _path: PathBuf,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    // Flush the outgoing vault. On save failure, keep it (and its lock) and
+    // release the lock we just acquired for the new one.
+    let had_vault = { state.borrow().vault.is_some() };
+    if had_vault {
+        if !prepare_to_leave_active(state, widgets, pending) {
+            drop(lock);
+            widgets
+                .save_status
+                .set_label("The current note could not be saved - staying on this vault.");
+            return;
+        }
+        persist_vault_session_state(state, widgets);
+    }
+
+    // Commit. The new vault is known-good and the old one is safely flushed.
+    widgets.vault_popover.popdown();
+    // Release the OLD writable lock now (not before the flush).
+    {
+        state.borrow_mut().vault_lock.take();
+    }
+    clear_sensitive_documents(state);
+    cancel_all_timers(pending);
+    cancel_pending_selection(widgets);
+    cancel_editor_deferrals(widgets);
+
+    let read_only = vault.is_read_only() || !lock.is_owner();
+    let migration_warning = vault.migration().warning();
+
+    let watcher = VaultWatcher::new(vault.root());
+    let watcher_error = watcher.as_ref().err().map(ToString::to_string);
+    let watcher = watcher.ok();
+
+    let config_save_error = {
+        let mut state = state.borrow_mut();
+        state.config.record_vault_open(vault.root(), vault.kind());
+        state.watcher = watcher;
+        state.vault = Some(vault);
+        state.vault_lock = Some(lock);
+        state.read_only = read_only;
+        state.notes.clear();
+        state.trash.clear();
+        state.body_dirty = false;
+        state.title_dirty = false;
+        state.title_draft.clear();
+        state.flow = UiFlow::default();
+        state.filter = FilterState::default();
+        state.config.save().err().map(|error| error.to_string())
+    };
+    // Bump the session generation *outside* the borrow above; the registry
+    // lives on `Widgets`, not in `AppState`.
+    widgets.sessions.bump();
+
+    // An encrypted vault opens locked: show the unlock screen instead of the
+    // workspace. No note list, editor, or search state is built until a
+    // successful unlock (see `begin_vault_unlock` → `enter_vault_workspace`).
+    let encrypted_locked = {
+        let state = state.borrow();
+        state
+            .vault
+            .as_ref()
+            .is_some_and(|vault| vault.is_encrypted() && vault.is_locked())
+    };
+    if encrypted_locked {
+        show_vault_locked_screen(state, widgets, pending, None);
+        return;
+    }
+
+    // Status line: read-only note first, then any softer warnings.
+    if read_only {
+        widgets.save_status.set_label(
+            migration_warning
+                .as_deref()
+                .unwrap_or("This vault is open read-only."),
+        );
+    } else if let Some(error) = watcher_error {
+        widgets
+            .save_status
+            .set_label(&format!("Vault opened without live updates: {error}"));
+    } else if let Some(error) = config_save_error {
+        widgets
+            .save_status
+            .set_label(&format!("Vault opened; settings were not saved: {error}"));
+    } else {
+        widgets.save_status.set_label("Saved");
+    }
+
+    enter_vault_workspace(state, widgets, pending);
+}
+
+/// Builds the workspace UI for the now-open (and, for an encrypted vault,
+/// unlocked) vault: header, view chrome, note list, notebooks, tags, and the
+/// restored selection. Shared by a plain vault switch (`commit_vault_switch`)
+/// and a successful encrypted-vault unlock (`begin_vault_unlock`).
+fn enter_vault_workspace(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    // Pull the working session copy from the right store: the plaintext config
+    // for a Standard Vault, the sealed manifest for an unlocked Secure Vault.
+    load_vault_session_state(state);
+    let (read_only, restore, display_name) = {
+        let state = state.borrow();
+        let Some(vault) = state.vault.as_ref() else {
+            return;
+        };
+        let path = vault.root().to_path_buf();
+        (
+            state.read_only,
+            Some(state.session.clone()),
+            vault_display_name_for(&state.config, &path),
+        )
+    };
+
+    widgets.vault_label.set_label(&display_name);
+    widgets.stack.set_visible_child_name("workspace");
+    if widgets.library_split.is_collapsed() {
+        widgets.library_split.set_show_sidebar(false);
+    }
+    widgets.content_split.set_show_content(false);
+    apply_read_only_ui(widgets, read_only);
+    // Coming out of a possibly-locked state: re-enable search and note actions
+    // (read-only still narrows them further via `apply_read_only_ui`).
+    widgets.search.set_sensitive(true);
+    set_note_actions_enabled(widgets, !read_only);
+    update_vault_lock_controls(state, widgets);
+    render_vault_switcher(state, widgets, pending);
+
+    // Restore the saved view (falling back to All Notes if it is gone).
+    let view = restore
+        .as_ref()
+        .and_then(|session| session.last_view.as_deref())
+        .and_then(parse_view_token)
+        .map(|view| resolve_restored_view(state, view))
+        .unwrap_or(ViewMode::AllNotes);
+    {
+        state.borrow_mut().flow.switch_view(view.clone());
+    }
+    apply_view_chrome(&view, widgets);
+    if !refresh_current_view(state, widgets) {
+        return;
+    }
+    render_notebook_list(state, widgets);
+    render_tags_list(state, widgets);
+
+    // Restore the saved note if it still exists, else fall back safely.
+    let restored_note = restore
+        .as_ref()
+        .and_then(|session| session.last_note)
+        .filter(|id| state.borrow().notes.iter().any(|note| note.id == *id));
+    let is_empty = { state.borrow().notes.is_empty() };
+    if let Some(id) = restored_note {
+        {
+            state.borrow_mut().flow.select_note(id);
+        }
+        select_row_target(RowTarget::Note(id), widgets);
+        select_note_without_prompting_if_locked(id, state, widgets);
+    } else if is_empty && !read_only {
+        create_new_note(state, widgets, pending);
+    } else {
+        select_first_row(state, widgets);
+    }
+
+    if let Some(offset) = restore.as_ref().and_then(|session| session.editor_scroll) {
+        restore_editor_scroll(widgets, offset);
+    }
+
+    update_note_quick_actions(state, widgets);
+
+    // An unlocked encrypted vault holds decrypted previews in memory, so start
+    // the idle-lock clock even before the first edit.
+    {
+        let mut state = state.borrow_mut();
+        touch_sensitive_activity(&mut state);
+    }
+
+    refresh_watch_baseline(state);
+}
+
+/// Updates the lock card's status line and re-arms its "Unlock Vault" button
+/// without disturbing the rest of the (already-primed) locked-vault workspace.
+/// Use this for follow-up messages such as a failed unlock attempt.
+fn set_vault_locked_message(widgets: &Widgets, message: Option<&str>) {
+    widgets.vault_unlock_button.set_sensitive(true);
+    widgets
+        .vault_locked_status
+        .set_label(message.unwrap_or_default());
+    widgets.vault_locked_status.set_visible(message.is_some());
+    widgets.content_split.set_show_content(true);
+    widgets
+        .document_stack
+        .set_visible_child_name("vault-locked");
+}
+
+/// Primes and shows the full locked-vault workspace. The application shell -
+/// header, vault identity, vault switcher and sidebar - stays visible and
+/// usable so the user can switch to another vault (including Main) *without*
+/// this vault's Vault Password. Only this vault's decrypted content is
+/// withheld: no note titles, notebooks, tags, search results or session state.
+fn show_vault_locked_screen(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+    message: Option<&str>,
+) {
+    let display_name = {
+        let state = state.borrow();
+        state
+            .vault
+            .as_ref()
+            .map(|vault| vault_display_name_for(&state.config, vault.root()))
+            .unwrap_or_else(|| APP_NAME.to_string())
+    };
+    widgets.vault_label.set_label(&display_name);
+    widgets.stack.set_visible_child_name("workspace");
+
+    // Nothing decrypted may survive into the locked view.
+    {
+        let _guard = widgets.editor_events.suppress();
+        widgets.title.set_text("");
+        set_buffer_text_silently(&widgets.buffer, "");
+    }
+    widgets.search.set_text("");
+    widgets.search.set_sensitive(false);
+
+    // `state.notes` / `state.trash` are already empty for a locked vault, so
+    // these render as empty lists - never this vault's real navigation data.
+    {
+        let mut state = state.borrow_mut();
+        state.flow.switch_view(ViewMode::AllNotes);
+        state.session = VaultSessionState::default();
+    }
+    apply_view_chrome(&ViewMode::AllNotes, widgets);
+    render_note_list(state, widgets);
+    // `list_notebooks` / tag scanning fail on a locked vault and would leave
+    // the *previous* vault's rows on screen - clear them outright instead.
+    clear_locked_vault_navigation(widgets);
+    render_vault_switcher(state, widgets, pending);
+    update_vault_lock_controls(state, widgets);
+    set_note_actions_enabled(widgets, false);
+    set_quick_actions_visible(widgets, false);
+
+    if widgets.library_split.is_collapsed() {
+        widgets.library_split.set_show_sidebar(false);
+    }
+
+    set_vault_locked_message(widgets, message);
+}
+
+/// Empties the notebook list and tag chips so a locked Secure Vault never shows
+/// navigation data - neither its own (undecryptable) nor the previous vault's
+/// (left behind because `list_notebooks` errors out on a locked vault).
+fn clear_locked_vault_navigation(widgets: &Widgets) {
+    let _guard = widgets.notebook_events.suppress();
+    while let Some(row) = widgets.notebook_list.row_at_index(0) {
+        widgets.notebook_list.remove(&row);
+    }
+    widgets.notebook_rows.borrow_mut().clear();
+    drop(_guard);
+
+    let _guard = widgets.tags_events.suppress();
+    while let Some(child) = widgets.tags_flow.first_child() {
+        widgets.tags_flow.remove(&child);
+    }
+}
+
+/// Shows/hides the header vault lock/unlock affordances for the open vault:
+/// the padlock glyph before the name, and the "Lock Vault" button (unlocked
+/// Secure Vault only - a Standard Vault never exposes a vault lock).
+fn update_vault_lock_controls(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let state = state.borrow();
+    let (is_secure, is_locked) = state
+        .vault
+        .as_ref()
+        .map(|vault| (vault.is_encrypted(), vault.is_locked()))
+        .unwrap_or((false, false));
+    widgets.vault_state_icon.set_visible(is_secure);
+    if is_secure {
+        widgets.vault_state_icon.set_icon_name(Some(if is_locked {
+            "channel-secure-symbolic"
+        } else {
+            "changes-allow-symbolic"
+        }));
+        widgets
+            .vault_state_icon
+            .set_tooltip_text(Some(if is_locked {
+                "This Secure Vault is locked"
             } else {
-                "Open a SenatorialNotes Vault"
-            })
-            .modal(true)
-            .build();
+                "This Secure Vault is unlocked"
+            }));
+    }
+    widgets
+        .vault_lock_button
+        .set_visible(is_secure && !is_locked);
+}
+
+/// Enables/disables the header actions that only make sense with an unlocked,
+/// writable vault open (New Note, Delete). Used to blank them while a Secure
+/// Vault is locked.
+fn set_note_actions_enabled(widgets: &Widgets, enabled: bool) {
+    widgets.new_note.set_sensitive(enabled);
+    widgets.new_notebook.set_sensitive(enabled);
+    widgets.delete_button.set_sensitive(enabled);
+}
+
+/// Prompts for the vault password and unlocks the open encrypted vault.
+/// Argon2id key derivation runs on a worker thread (`gio::spawn_blocking`) so
+/// the GTK main loop is never blocked. A failed unlock changes nothing.
+fn begin_vault_unlock(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let (keyfile, vault_id) = {
+        let state = state.borrow();
+        let Some(vault) = state.vault.as_ref() else {
+            return;
+        };
+        if !vault.is_encrypted() || !vault.is_locked() {
+            return;
+        }
+        match vault.encrypted_keyfile() {
+            Ok(bytes) => (bytes, vault.vault_id()),
+            Err(error) => {
+                set_vault_locked_message(
+                    widgets,
+                    Some(&format!(
+                        "This Secure Vault's key file could not be read: {error}"
+                    )),
+                );
+                return;
+            }
+        }
+    };
+
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    present_password_dialog(
+        &widgets.window.clone(),
+        "Unlock Vault",
+        "Enter the vault password. Deriving the key can take a moment.",
+        false,
+        false,
+        "Unlock Vault",
+        move |maybe_password| {
+            let Some(password) = maybe_password else {
+                return;
+            };
+            let session = widgets.sessions.current();
+            widgets.vault_unlock_button.set_sensitive(false);
+            widgets.vault_locked_status.set_visible(true);
+            widgets
+                .vault_locked_status
+                .set_label("Deriving the vault key…");
+
+            let worker = gio::spawn_blocking(move || -> senatorial_notes::Result<VaultKeys> {
+                vault_crypto::open_keyfile(&keyfile, vault_id, password.as_str())
+            });
+
+            let state = state.clone();
+            let widgets = widgets.clone();
+            let pending = pending.clone();
+            glib::spawn_future_local(async move {
+                let outcome = worker.await;
+                if !widgets.sessions.is_current(session) {
+                    return;
+                }
+                match outcome {
+                    Ok(Ok(keys)) => {
+                        let finished = {
+                            let state = state.borrow();
+                            state.vault.as_ref().map(|vault| vault.finish_unlock(keys))
+                        };
+                        match finished {
+                            Some(Ok(())) => {
+                                widgets.save_status.set_label("Saved");
+                                enter_vault_workspace(&state, &widgets, &pending);
+                            }
+                            Some(Err(error)) => set_vault_locked_message(
+                                &widgets,
+                                Some(&format!("The vault could not be unlocked: {error}")),
+                            ),
+                            None => {}
+                        }
+                    }
+                    Ok(Err(_)) => set_vault_locked_message(
+                        &widgets,
+                        Some(
+                            "That password did not unlock the vault. The vault password may be \
+                             wrong, or the vault's key file may be damaged.",
+                        ),
+                    ),
+                    Err(_) => set_vault_locked_message(
+                        &widgets,
+                        Some("The key-derivation task failed unexpectedly."),
+                    ),
+                }
+            });
+        },
+    );
+}
+
+/// Locks the open encrypted vault: flushes the active note, drops all
+/// in-memory plaintext and key material, clears the note / search / editor
+/// state, and shows the lock screen. A no-op for an ordinary vault or one that
+/// is already locked. Returns whether it actually locked.
+fn lock_vault(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) -> bool {
+    let should_lock = {
+        let state = state.borrow();
+        state
+            .vault
+            .as_ref()
+            .is_some_and(|vault| vault.is_encrypted() && !vault.is_locked())
+    };
+    if !should_lock {
+        return false;
+    }
+
+    // Flush the open note first. If it will not save, stay unlocked.
+    if !persist_active(state, widgets, true) {
+        widgets
+            .save_status
+            .set_label("The current note could not be saved - the vault stays unlocked.");
+        return false;
+    }
+    persist_vault_session_state(state, widgets);
+
+    cancel_all_timers(pending);
+    cancel_pending_selection(widgets);
+    cancel_editor_deferrals(widgets);
+    clear_sensitive_documents(state);
+
+    {
+        let mut state = state.borrow_mut();
+        if let Some(vault) = state.vault.as_ref() {
+            vault.lock();
+        }
+        state.notes.clear();
+        state.trash.clear();
+        state.body_dirty = false;
+        state.title_dirty = false;
+        state.title_draft.clear();
+        state.flow = UiFlow::default();
+        state.filter = FilterState::default();
+    }
+    // Any deferred callback armed against the unlocked session is now inert.
+    widgets.sessions.bump();
+
+    {
+        let _guard = widgets.editor_events.suppress();
+        widgets.title.set_text("");
+        set_buffer_text_silently(&widgets.buffer, "");
+    }
+    widgets.search.set_text("");
+    // The vault is no longer unlocked: disable its Secure-Vault menu actions
+    // and show the locked-vault workspace (shell stays usable).
+    render_vault_switcher(state, widgets, pending);
+    show_vault_locked_screen(state, widgets, pending, None);
+    true
+}
+
+/// Picks a folder and a password, then creates a new encrypted vault and opens
+/// it (unlocked for this session). Key derivation runs off the GTK main thread.
+fn present_encrypted_vault_creator(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    widgets.vault_popover.popdown();
+    let dialog = gtk::FileDialog::builder()
+        .title("Choose a Folder for the New Secure Vault")
+        .modal(true)
+        .build();
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    let parent = widgets.window.clone();
+    dialog.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
+        let path = match result {
+            Ok(folder) => match folder.path() {
+                Some(path) => path,
+                None => {
+                    report_vault_open_error(
+                        &state,
+                        &widgets,
+                        "The selected folder is not a local path.",
+                    );
+                    return;
+                }
+            },
+            Err(error) if !error.matches(gio::IOErrorEnum::Cancelled) => {
+                report_vault_open_error(
+                    &state,
+                    &widgets,
+                    &format!("Folder selection failed: {error}"),
+                );
+                return;
+            }
+            Err(_) => return,
+        };
+
+        // Refuse a folder that already holds a vault or plaintext notes *before*
+        // prompting for a password or deriving a key. Stamping an encrypted
+        // keyfile onto an existing ordinary vault would leave its notes in
+        // plaintext; conversion is not supported in this release.
+        if let Err(error) = Vault::check_encrypted_target(&path) {
+            report_vault_open_error(&state, &widgets, &format!("{error}"));
+            return;
+        }
+
         let state = state.clone();
         let widgets = widgets.clone();
-        let parent = widgets.window.clone();
-        dialog.select_folder(
-            Some(&parent),
-            None::<&gio::Cancellable>,
-            move |result| match result {
-                Ok(folder) => match folder.path() {
-                    Some(path) => open_vault(&path, create, &state, &widgets),
-                    None => {
-                        show_welcome_error(&widgets, "The selected folder is not a local path.")
+        let pending = pending.clone();
+        present_password_dialog(
+            &widgets.window.clone(),
+            "Vault Password",
+            "Everything in this vault will be encrypted and protected by this vault password. \
+             There is no recovery if it is lost.",
+            true,
+            true,
+            "Create Secure Vault",
+            move |maybe_password| {
+                let Some(password) = maybe_password else {
+                    return;
+                };
+                let vault_id = Uuid::new_v4();
+                let session = widgets.sessions.current();
+                widgets
+                    .welcome_status
+                    .set_label("Creating the Secure Vault…");
+
+                let worker = gio::spawn_blocking(
+                    move || -> senatorial_notes::Result<(Vec<u8>, VaultKeys)> {
+                        vault_crypto::create_keyfile(vault_id, password.as_str())
+                    },
+                );
+                let state = state.clone();
+                let widgets = widgets.clone();
+                let pending = pending.clone();
+                let path = path.clone();
+                glib::spawn_future_local(async move {
+                    let outcome = worker.await;
+                    if !widgets.sessions.is_current(session) {
+                        return;
                     }
-                },
-                Err(error) if !error.matches(gio::IOErrorEnum::Cancelled) => {
-                    show_welcome_error(&widgets, &format!("Folder selection failed: {error}"));
-                }
-                Err(_) => {}
+                    let created = match outcome {
+                        Ok(Ok((keyfile_bytes, keys))) => {
+                            Vault::finish_create_encrypted(&path, vault_id, &keyfile_bytes, keys)
+                        }
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => {
+                            report_vault_open_error(
+                                &state,
+                                &widgets,
+                                "Key derivation failed unexpectedly.",
+                            );
+                            return;
+                        }
+                    };
+                    match created {
+                        Ok(vault) => {
+                            proceed_with_opened_vault(vault, path, &state, &widgets, &pending)
+                        }
+                        Err(error) => report_vault_open_error(
+                            &state,
+                            &widgets,
+                            &format!("The Secure Vault could not be created: {error}"),
+                        ),
+                    }
+                });
             },
         );
     });
 }
 
-fn open_vault(path: &Path, create: bool, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
-    let result = if create {
-        Vault::create(path)
-    } else {
-        Vault::open(path)
+/// Creates the first-run "Main" Standard Vault under the managed workspace
+/// root, records it, and shows the one-time first-run panel. On any failure
+/// the user is left on the ordinary welcome screen and first-run is **not**
+/// marked done, so it is retried next launch.
+fn run_first_run_setup(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let Some(root) = paths::default_workspace_root() else {
+        show_welcome_error(
+            widgets,
+            "SenatorialNotes could not locate your Documents folder. \
+             Use \u{201c}Create Vault\u{2026}\u{201d} to choose a location.",
+        );
+        return;
     };
-    match result {
+    let main_path = root.join("Main");
+    match Vault::create(&main_path) {
         Ok(vault) => {
-            clear_sensitive_documents(state);
-            let watcher = VaultWatcher::new(vault.root());
-            let watcher_error = watcher.as_ref().err().map(ToString::to_string);
-            let watcher = watcher.ok();
-            let config_save_error = {
+            {
                 let mut state = state.borrow_mut();
-                state.config.remember_vault(vault.root());
-                state.watcher = watcher;
-                state.vault = Some(vault);
-                state.notes.clear();
-                state.trash.clear();
-                state.body_dirty = false;
-                state.title_dirty = false;
-                state.flow.switch_view(ViewMode::AllNotes);
-                state.filter = FilterState::default();
-                state.config.save().err().map(|error| error.to_string())
-            };
-            if let Some(error) = watcher_error {
-                widgets
-                    .save_status
-                    .set_label(&format!("Vault opened without live updates: {error}"));
+                state
+                    .config
+                    .record_vault_open(vault.root(), VaultKind::Ordinary);
+                state.config.set_vault_display_name(vault.root(), "Main");
+                state.config.first_run_done = true;
+                let _ = state.config.save();
             }
-            if let Some(error) = config_save_error {
-                widgets
-                    .save_status
-                    .set_label(&format!("Vault opened; settings were not saved: {error}"));
-            }
-            widgets.vault_label.set_label(
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(APP_NAME),
-            );
-            widgets.stack.set_visible_child_name("workspace");
-            if widgets.library_split.is_collapsed() {
-                widgets.library_split.set_show_sidebar(false);
-            }
-            widgets.content_split.set_show_content(false);
-            apply_view_chrome(&ViewMode::AllNotes, widgets);
-            if !refresh_current_view(state, widgets) {
-                return;
-            }
-            render_notebook_list(state, widgets);
-            render_tags_list(state, widgets);
-            let is_empty = { state.borrow().notes.is_empty() };
-            if is_empty {
-                create_new_note(
-                    state,
-                    widgets,
-                    &Rc::new(RefCell::new(PendingSaves::default())),
-                );
-            } else {
-                select_first_row(state, widgets);
-            }
-            refresh_watch_baseline(state);
+            widgets.first_run_panel.set_visible(true);
+            widgets.stack.set_visible_child_name("welcome");
+            render_vault_switcher(state, widgets, pending);
         }
-        Err(error) => show_welcome_error(widgets, &format!("Could not open the vault: {error}")),
+        Err(error) => {
+            show_welcome_error(
+                widgets,
+                &format!(
+                    "Your workspace could not be set up automatically ({error}). \
+                     Use \u{201c}Create Vault\u{2026}\u{201d} to choose a location."
+                ),
+            );
+        }
     }
 }
 
+/// First-run "Set Secure Vault Password" / sidebar "New Secure Vault": creates
+/// a Secure Vault in the managed workspace root with **no folder picker**,
+/// display name "Secure" (or "Secure 2", …). The password is asked first and
+/// the vault is only created once a valid password is set (there is no
+/// uninitialised on-disk vault). Key derivation runs off the GTK main thread.
+fn present_managed_secure_vault_setup(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    widgets.vault_popover.popdown();
+    let Some(root) = paths::default_workspace_root() else {
+        report_vault_open_error(
+            state,
+            widgets,
+            "SenatorialNotes could not locate your Documents folder. \
+             Use \u{201c}Create Secure Vault\u{2026}\u{201d} to choose a location.",
+        );
+        return;
+    };
+
+    // A clean managed folder: Secure, Secure 2, Secure 3, …
+    let mut chosen: Option<(PathBuf, String)> = None;
+    for n in 0..50 {
+        let name = if n == 0 {
+            "Secure".to_string()
+        } else {
+            format!("Secure {}", n + 1)
+        };
+        let folder = root.join(&name);
+        if Vault::check_encrypted_target(&folder).is_ok() {
+            chosen = Some((folder, name));
+            break;
+        }
+    }
+    let Some((target, display)) = chosen else {
+        report_vault_open_error(
+            state,
+            widgets,
+            "Could not find a free folder for a new Secure Vault. \
+             Use \u{201c}Create Secure Vault\u{2026}\u{201d} to choose a location.",
+        );
+        return;
+    };
+
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    present_password_dialog(
+        &widgets.window.clone(),
+        "Set Secure Vault Password",
+        "Everything in your Secure Vault is encrypted and protected by this vault password. \
+         There is no recovery if it is lost.",
+        true,
+        true,
+        "Create Secure Vault",
+        move |maybe_password| {
+            let Some(password) = maybe_password else {
+                return;
+            };
+            let vault_id = Uuid::new_v4();
+            let session = widgets.sessions.current();
+            widgets
+                .welcome_status
+                .set_label("Creating your Secure Vault…");
+
+            let worker =
+                gio::spawn_blocking(move || -> senatorial_notes::Result<(Vec<u8>, VaultKeys)> {
+                    vault_crypto::create_keyfile(vault_id, password.as_str())
+                });
+            let state = state.clone();
+            let widgets = widgets.clone();
+            let pending = pending.clone();
+            let target = target.clone();
+            let display = display.clone();
+            glib::spawn_future_local(async move {
+                let outcome = worker.await;
+                if !widgets.sessions.is_current(session) {
+                    return;
+                }
+                let created = match outcome {
+                    Ok(Ok((keyfile_bytes, keys))) => {
+                        Vault::finish_create_encrypted(&target, vault_id, &keyfile_bytes, keys)
+                    }
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => {
+                        report_vault_open_error(
+                            &state,
+                            &widgets,
+                            "Key derivation failed unexpectedly.",
+                        );
+                        return;
+                    }
+                };
+                match created {
+                    Ok(vault) => {
+                        {
+                            let mut state = state.borrow_mut();
+                            state.config.set_vault_display_name(vault.root(), &display);
+                            let _ = state.config.save();
+                        }
+                        widgets.first_run_panel.set_visible(false);
+                        proceed_with_opened_vault(vault, target, &state, &widgets, &pending);
+                    }
+                    Err(error) => report_vault_open_error(
+                        &state,
+                        &widgets,
+                        &format!("The Secure Vault could not be created: {error}"),
+                    ),
+                }
+            });
+        },
+    );
+}
+
+/// What the dialog's third button does, if there is one.
+enum ContentionAction {
+    /// Proven-dead lock: a reviewed writable takeover.
+    TakeOver(DeadReason),
+    /// A live session on this machine: try to raise its window.
+    ShowExistingWindow,
+}
+
+/// Modal dialog shown when the new vault's advisory lock is contended.
+///
+/// **Takeover is offered only for a [`LockStatus::ProvenDead`] lock** - one
+/// where the previous owner is positively known not to be running. A
+/// [`LockStatus::Blocked`] lock (a live session, a network peer we cannot
+/// verify, a malformed or newer-format file) offers only Open Read-Only and
+/// Cancel. In every case the current vault/session is untouched until a
+/// decision is made, and a read-only fallback never modifies the blocked
+/// owner's lock file.
+fn present_lock_contention_dialog(
+    vault: Vault,
+    status: LockStatus,
+    path: PathBuf,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let name = { vault_display_name_for(&state.borrow().config, &path) };
+    let lock_file = vault.state_dir().join("vault.lock");
+
+    let (detail, buttons, action): (String, Vec<&str>, Option<ContentionAction>) = match &status {
+        LockStatus::ProvenDead { owner, reason } => (
+            format!(
+                "\u{201c}{name}\u{201d} has a lock left behind. {} You can open it read-only, or \
+                 take over the lock.",
+                reason.explain(owner)
+            ),
+            vec!["Cancel", "Open Read-Only", "Take Over"],
+            Some(ContentionAction::TakeOver(*reason)),
+        ),
+        LockStatus::Blocked {
+            owner,
+            reason: BlockedReason::Live,
+        } => (
+            BlockedReason::Live.explain(owner.as_ref(), &lock_file),
+            vec!["Cancel", "Open Read-Only", "Show Existing Window"],
+            Some(ContentionAction::ShowExistingWindow),
+        ),
+        LockStatus::Blocked { owner, reason } => (
+            reason.explain(owner.as_ref(), &lock_file),
+            vec!["Cancel", "Open Read-Only"],
+            None,
+        ),
+        // acquire never returns Free / HeldByThisProcess as Contended.
+        LockStatus::Free | LockStatus::HeldByThisProcess => {
+            commit_vault_switch(vault, VaultLock::read_only(), path, state, widgets, pending);
+            return;
+        }
+    };
+
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message(format!(
+            "Another session may be using \u{201c}{name}\u{201d}"
+        ))
+        .detail(detail)
+        .buttons(buttons)
+        .cancel_button(0)
+        .default_button(0)
+        .build();
+
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    let parent = widgets.window.clone();
+    dialog.choose(Some(&parent), None::<&gio::Cancellable>, move |result| {
+        let Ok(choice) = result else {
+            return;
+        };
+        match choice {
+            // Cancel: the switch is abandoned; the current vault is untouched.
+            0 => {}
+            // Open read-only - a non-owning lock; the blocked owner's file is
+            // never touched.
+            1 => commit_vault_switch(
+                vault,
+                VaultLock::read_only(),
+                path,
+                &state,
+                &widgets,
+                &pending,
+            ),
+            2 => match &action {
+                Some(ContentionAction::TakeOver(reason)) => {
+                    match VaultLock::take_over(&vault, *reason) {
+                        Ok(LockAcquisition::Acquired(lock)) => {
+                            commit_vault_switch(vault, lock, path, &state, &widgets, &pending)
+                        }
+                        Ok(LockAcquisition::Contended(_)) => report_vault_open_error(
+                            &state,
+                            &widgets,
+                            "The vault's lock changed while the dialog was open - it was not \
+                             taken over.",
+                        ),
+                        Err(error) => report_vault_open_error(
+                            &state,
+                            &widgets,
+                            &format!("Could not take over the vault lock: {error}"),
+                        ),
+                    }
+                }
+                Some(ContentionAction::ShowExistingWindow) => {
+                    if let Some(app) = widgets.window.application() {
+                        app.activate();
+                    }
+                }
+                None => {}
+            },
+            _ => {}
+        }
+    });
+}
+
+/// The folder's own name, for the header switcher.
+/// The folder-derived fallback name for a vault at `path`.
+fn vault_display_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(APP_NAME)
+}
+
+/// The vault's display name: the user-chosen name from `config.vault_index`
+/// if set, otherwise the folder basename. A rename only ever changes the
+/// stored display name - never the folder, the vault, or any blob.
+fn vault_display_name_for(config: &AppConfig, path: &Path) -> String {
+    config
+        .vault_display_name(path)
+        .map(str::to_string)
+        .unwrap_or_else(|| vault_display_name(path).to_string())
+}
+
+/// Serialises a `ViewMode` for `VaultSessionState::last_view`.
+fn view_token(view: &ViewMode) -> String {
+    match view {
+        ViewMode::AllNotes => "all-notes".to_string(),
+        ViewMode::RecentlyOpened => "recently-opened".to_string(),
+        ViewMode::Favourites => "favourites".to_string(),
+        ViewMode::Pinned => "pinned".to_string(),
+        ViewMode::Archive => "archive".to_string(),
+        ViewMode::EncryptedNotes => "encrypted-notes".to_string(),
+        ViewMode::Trash => "trash".to_string(),
+        ViewMode::Notebook(path) => format!("notebook:{}", path.display()),
+    }
+}
+
+fn parse_view_token(token: &str) -> Option<ViewMode> {
+    match token {
+        "all-notes" => Some(ViewMode::AllNotes),
+        "recently-opened" => Some(ViewMode::RecentlyOpened),
+        "favourites" => Some(ViewMode::Favourites),
+        "pinned" => Some(ViewMode::Pinned),
+        // A vault last left on the removed "Recently Edited" view opens on
+        // "Recently Opened" now.
+        "recently-edited" => Some(ViewMode::RecentlyOpened),
+        "archive" => Some(ViewMode::Archive),
+        "encrypted-notes" => Some(ViewMode::EncryptedNotes),
+        "trash" => Some(ViewMode::Trash),
+        other => other
+            .strip_prefix("notebook:")
+            .map(|path| ViewMode::Notebook(PathBuf::from(path))),
+    }
+}
+
+/// A restored `Notebook` view that no longer exists on disk falls back to All
+/// Notes; every other view is used as-is.
+fn resolve_restored_view(state: &Rc<RefCell<AppState>>, view: ViewMode) -> ViewMode {
+    let ViewMode::Notebook(ref relative) = view else {
+        return view;
+    };
+    let exists = {
+        let state = state.borrow();
+        state.vault.as_ref().is_some_and(|vault| {
+            vault
+                .list_notebooks()
+                .map(|notebooks| {
+                    notebooks
+                        .iter()
+                        .any(|entry| entry.relative_path == *relative)
+                })
+                .unwrap_or(false)
+        })
+    };
+    if exists { view } else { ViewMode::AllNotes }
+}
+
+/// Cancels the debounced editor-presentation timers so a stale one cannot fire
+/// into the next vault's editor. (They carry no vault state, but the buffer
+/// they target is reused across vaults.)
+fn cancel_editor_deferrals(widgets: &Widgets) {
+    if let Some(source) = widgets.style_recompute_source.borrow_mut().take() {
+        source.remove();
+    }
+    if let Some(source) = widgets.format_toolbar_update_source.borrow_mut().take() {
+        source.remove();
+    }
+}
+
+/// Captures the current vault's per-vault UI state (last note, last view,
+/// recently-opened list, editor scroll). Never stores note *contents*.
+///
+/// - **Standard Vault** → the app config, keyed by `vault_id`.
+/// - **Secure Vault** → its sealed encrypted manifest (never plaintext), and
+///   only while it is unlocked.
+fn persist_vault_session_state(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let scroll = editor_scroll_offset(widgets);
+    let mut state = state.borrow_mut();
+    let Some(vault) = state.vault.as_ref() else {
+        return;
+    };
+    let vault_id = vault.vault_id();
+    let is_encrypted = vault.is_encrypted();
+    let is_locked = vault.is_locked();
+
+    state.session.last_note = state.flow.selected_note();
+    state.session.last_view = Some(view_token(state.flow.view()));
+    state.session.editor_scroll = scroll;
+    let session = state.session.clone();
+
+    if is_encrypted {
+        // A locked Secure Vault has no key to seal with; the working copy is
+        // simply dropped. The notebook name in `last_view`, note UUIDs in
+        // `recently_opened`, etc. must never reach the plaintext config.
+        if !is_locked && let Some(vault) = state.vault.as_ref() {
+            let _ = vault.set_encrypted_session_state(session);
+        }
+        return;
+    }
+    state.config.set_vault_session(vault_id, session);
+    let _ = state.config.save();
+}
+
+/// Loads the working session-state copy for the just-opened vault.
+fn load_vault_session_state(state: &Rc<RefCell<AppState>>) {
+    let mut state = state.borrow_mut();
+    let Some(vault) = state.vault.as_ref() else {
+        state.session = VaultSessionState::default();
+        return;
+    };
+    state.session = if vault.is_encrypted() {
+        vault.encrypted_session_state().unwrap_or_default()
+    } else {
+        state
+            .config
+            .vault_session(vault.vault_id())
+            .cloned()
+            .unwrap_or_default()
+    };
+}
+
+/// Records that the user opened/viewed note `id` (for "Recently Opened").
+/// Never rewrites the note file.
+fn record_note_opened(state: &mut AppState, id: Uuid) {
+    state.session.record_opened(id);
+}
+
+fn editor_scroll_offset(widgets: &Widgets) -> Option<f64> {
+    let value = widgets.editor.vadjustment()?.value();
+    (value > 0.0).then_some(value)
+}
+
+fn restore_editor_scroll(widgets: &Widgets, offset: f64) {
+    let Some(adjustment) = widgets.editor.vadjustment() else {
+        return;
+    };
+    // The buffer has just been populated; the adjustment's upper bound is not
+    // settled until GTK has laid the view out, so defer the restore.
+    glib::idle_add_local_once(move || {
+        let ceiling = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        adjustment.set_value(offset.min(ceiling));
+    });
+}
+
+/// Enables or disables every control that would mutate the vault, and shows the
+/// read-only indicator. Browsing (selection, view switching, search, reading a
+/// note) is never disabled.
+fn apply_read_only_ui(widgets: &Widgets, read_only: bool) {
+    let writable = !read_only;
+    widgets.vault_readonly_icon.set_visible(read_only);
+    for widget in [
+        widgets.new_note.upcast_ref::<gtk::Widget>(),
+        widgets.new_notebook.upcast_ref::<gtk::Widget>(),
+        widgets.delete_button.upcast_ref::<gtk::Widget>(),
+    ] {
+        widget.set_sensitive(writable);
+    }
+    widgets.formatting_bar.set_sensitive(writable);
+    widgets.tag_add_entry.set_sensitive(writable);
+    // `set_editable(false)` keeps the text selectable/scrollable for reading
+    // while blocking every edit - `changed` never fires from a rejected keypress.
+    widgets.title.set_editable(writable);
+    widgets.editor.set_editable(writable);
+}
+
+/// Rebuilds the header vault-switcher popover (current identity + read-only
+/// note + recent list) and the welcome-screen recent list.
+fn render_vault_switcher(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let (secure_vault_unlocked, vault_open) = {
+        let state = state.borrow();
+        (
+            state
+                .vault
+                .as_ref()
+                .is_some_and(|vault| vault.is_encrypted() && !vault.is_locked()),
+            state.vault.is_some(),
+        )
+    };
+    widgets
+        .vault_popover_secure_actions
+        .set_visible(secure_vault_unlocked);
+    // Disable the Secure-Vault menu actions for a Standard Vault so "Lock
+    // Vault" cannot be invoked where there is no vault-level key; "Rename
+    // Vault…" needs any open vault.
+    if let Some(app) = widgets.window.application() {
+        let toggle = |name: &str, enabled: bool| {
+            if let Some(action) = app.lookup_action(name)
+                && let Ok(action) = action.downcast::<gio::SimpleAction>()
+            {
+                action.set_enabled(enabled);
+            }
+        };
+        toggle("lock-vault", secure_vault_unlocked);
+        toggle("change-vault-password", secure_vault_unlocked);
+        toggle("rename-vault", vault_open);
+    }
+
+    let (current_root, current_name, read_only, warning, recents) = {
+        let state = state.borrow();
+        let current_root = state.vault.as_ref().map(|vault| vault.root().to_path_buf());
+        let current_name = current_root
+            .as_deref()
+            .map(|path| vault_display_name_for(&state.config, path));
+        let warning = state
+            .vault
+            .as_ref()
+            .and_then(|vault| vault.migration().warning());
+        (
+            current_root,
+            current_name,
+            state.read_only,
+            warning,
+            state.config.recent_vaults_mru(),
+        )
+    };
+
+    widgets
+        .vault_popover_name
+        .set_label(current_name.as_deref().unwrap_or("No vault open"));
+    widgets.vault_popover_path.set_label(
+        current_root
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default()
+            .as_str(),
+    );
+    let status = match (read_only, warning.as_deref()) {
+        (true, Some(reason)) => format!("Read-only · {reason}"),
+        (true, None) => "Read-only".to_string(),
+        (false, Some(reason)) => reason.to_string(),
+        (false, None) => String::new(),
+    };
+    widgets.vault_popover_status.set_visible(!status.is_empty());
+    widgets.vault_popover_status.set_label(&status);
+    if read_only {
+        widgets.vault_popover_status.add_css_class("warning");
+    } else {
+        widgets.vault_popover_status.remove_css_class("warning");
+    }
+
+    let current_canonical = current_root.as_deref().map(canonical_path);
+    for container in [&widgets.vault_recent_box, &widgets.welcome_recent_box] {
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+    }
+    let mut shown = 0usize;
+    for path in recents {
+        if current_canonical.as_deref() == Some(&canonical_path(&path)) {
+            continue;
+        }
+        widgets
+            .vault_recent_box
+            .append(&recent_vault_row(&path, state, widgets, pending));
+        widgets
+            .welcome_recent_box
+            .append(&recent_vault_row(&path, state, widgets, pending));
+        shown += 1;
+    }
+    let has_recents = shown > 0;
+    widgets.welcome_recent_box.set_visible(has_recents);
+    widgets.welcome_recent_heading.set_visible(has_recents);
+    if !has_recents {
+        let empty = gtk::Label::new(Some("No other vaults yet"));
+        empty.add_css_class("caption");
+        empty.add_css_class("dim-label");
+        empty.set_xalign(0.0);
+        widgets.vault_recent_box.append(&empty);
+    }
+
+    render_secure_vaults_sidebar(state, widgets, pending);
+}
+
+/// Maximum Secure Vaults shown directly in the sidebar; the rest are behind
+/// "More…" (which opens the full vault switcher).
+const SIDEBAR_SECURE_VAULTS: usize = 4;
+
+/// Rebuilds the "Secured Vaults" sidebar section: up to
+/// [`SIDEBAR_SECURE_VAULTS`] Secure Vaults (most-recently-opened first), each a
+/// direct switch button, plus a "More…" row when there are more. The list is
+/// never unbounded.
+fn render_secure_vaults_sidebar(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    while let Some(child) = widgets.secure_vaults_box.first_child() {
+        widgets.secure_vaults_box.remove(&child);
+    }
+
+    let (vaults, current_canonical) = {
+        let state = state.borrow();
+        let current = state
+            .vault
+            .as_ref()
+            .filter(|vault| vault.is_encrypted())
+            .map(|vault| canonical_path(vault.root()));
+        (state.config.secure_vaults_mru(), current)
+    };
+
+    if vaults.is_empty() {
+        let hint = gtk::Label::new(Some("No Secure Vaults yet"));
+        hint.add_css_class("caption");
+        hint.add_css_class("dim-label");
+        hint.set_xalign(0.0);
+        widgets.secure_vaults_box.append(&hint);
+        return;
+    }
+
+    for path in vaults.iter().take(SIDEBAR_SECURE_VAULTS) {
+        let display_name = { vault_display_name_for(&state.borrow().config, path) };
+        let button = sidebar_button(&display_name, "channel-secure-symbolic");
+        button.set_tooltip_text(Some("Switch to this Secure Vault"));
+        if current_canonical.as_deref() == Some(&canonical_path(path)) {
+            button.add_css_class("sidebar-selected");
+        }
+        {
+            let state = state.clone();
+            let widgets = widgets.clone();
+            let pending = pending.clone();
+            let path = path.clone();
+            button.connect_clicked(move |_| open_vault(&path, false, &state, &widgets, &pending));
+        }
+        widgets.secure_vaults_box.append(&button);
+    }
+
+    if vaults.len() > SIDEBAR_SECURE_VAULTS {
+        let more = sidebar_button("More…", "view-more-symbolic");
+        more.set_tooltip_text(Some("Show all vaults"));
+        let widgets_for_more = widgets.clone();
+        more.connect_clicked(move |_| widgets_for_more.vault_popover.popup());
+        widgets.secure_vaults_box.append(&more);
+    }
+}
+
+/// One recent-vault row: a switch button (name + path) plus a "remove from
+/// recent" button. A folder that is no longer present is shown as unavailable
+/// and cannot be opened, only removed.
+fn recent_vault_row(
+    path: &Path,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) -> gtk::Widget {
+    let available = path.is_dir();
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let display_name = { vault_display_name_for(&state.borrow().config, path) };
+    let name = gtk::Label::new(Some(&format!(
+        "{}{}",
+        display_name,
+        if available { "" } else { "  (missing)" }
+    )));
+    name.set_xalign(0.0);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    let path_label = gtk::Label::new(Some(&path.display().to_string()));
+    path_label.set_xalign(0.0);
+    path_label.add_css_class("caption");
+    path_label.add_css_class("dim-label");
+    path_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    text.append(&name);
+    text.append(&path_label);
+
+    let open = gtk::Button::builder()
+        .child(&text)
+        .css_classes(["flat"])
+        .hexpand(true)
+        .sensitive(available)
+        .tooltip_text(if available {
+            "Switch to this vault"
+        } else {
+            "This folder is no longer available"
+        })
+        .build();
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        let path = path.to_path_buf();
+        open.connect_clicked(move |_| {
+            open_vault(&path, false, &state, &widgets, &pending);
+        });
+    }
+    row.append(&open);
+
+    let forget = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .tooltip_text("Remove from Recent")
+        .build();
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        let path = path.to_path_buf();
+        forget.connect_clicked(move |_| {
+            {
+                let mut state = state.borrow_mut();
+                state.config.forget_vault(&path);
+                let _ = state.config.save();
+            }
+            render_vault_switcher(&state, &widgets, &pending);
+        });
+    }
+    row.append(&forget);
+    row.upcast()
+}
+
 fn switch_view(mode: ViewMode, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    // A locked Secure Vault has no decrypted notes to show. Keep the sidebar
+    // affordances inert rather than surfacing a "could not refresh" error.
+    let vault_locked = {
+        let state = state.borrow();
+        state
+            .vault
+            .as_ref()
+            .is_some_and(|vault| vault.is_encrypted() && vault.is_locked())
+    };
+    if vault_locked {
+        if widgets.library_split.is_collapsed() {
+            widgets.library_split.set_show_sidebar(false);
+        }
+        return;
+    }
     let already_selected = { state.borrow().flow.view() == &mode };
     if already_selected {
         if widgets.library_split.is_collapsed() {
@@ -1493,6 +3446,7 @@ fn switch_view(mode: ViewMode, state: &Rc<RefCell<AppState>>, widgets: &Widgets)
     widgets.search.set_text("");
     apply_view_chrome(&mode, widgets);
     widgets.document_stack.set_visible_child_name("empty");
+    set_quick_actions_visible(widgets, false);
     if widgets.library_split.is_collapsed() {
         widgets.library_split.set_show_sidebar(false);
     }
@@ -1565,9 +3519,8 @@ fn create_new_note(
 
 fn apply_view_chrome(mode: &ViewMode, widgets: &Widgets) {
     widgets.notes_heading.set_label(&mode.heading());
-    widgets
-        .search
-        .set_placeholder_text(Some(&mode.search_placeholder()));
+    // The sidebar search box keeps a stable product-wording placeholder; it
+    // always searches the current vault, never a per-view label.
     widgets
         .empty_trash_button
         .set_visible(*mode == ViewMode::Trash);
@@ -1578,8 +3531,9 @@ fn update_library_selection(mode: &ViewMode, widgets: &Widgets) {
     for button in [
         &widgets.all_notes_button,
         &widgets.inbox_button,
+        &widgets.recently_opened_button,
+        &widgets.favourites_button,
         &widgets.pinned_button,
-        &widgets.recently_edited_button,
         &widgets.archive_button,
         &widgets.trash_button,
     ] {
@@ -1591,11 +3545,15 @@ fn update_library_selection(mode: &ViewMode, widgets: &Widgets) {
         ViewMode::Notebook(path) if path.as_path() == inbox => {
             widgets.inbox_button.add_css_class("sidebar-selected");
         }
-        ViewMode::Pinned => widgets.pinned_button.add_css_class("sidebar-selected"),
-        ViewMode::RecentlyEdited => widgets
-            .recently_edited_button
+        ViewMode::RecentlyOpened => widgets
+            .recently_opened_button
             .add_css_class("sidebar-selected"),
+        ViewMode::Favourites => widgets.favourites_button.add_css_class("sidebar-selected"),
+        ViewMode::Pinned => widgets.pinned_button.add_css_class("sidebar-selected"),
         ViewMode::Archive => widgets.archive_button.add_css_class("sidebar-selected"),
+        // `EncryptedNotes` has no sidebar row in this design; it is reachable
+        // only via a restored session token and shows no selection highlight.
+        ViewMode::EncryptedNotes => {}
         ViewMode::Trash => widgets.trash_button.add_css_class("sidebar-selected"),
         ViewMode::Notebook(_) => {}
     }
@@ -1682,6 +3640,7 @@ fn open_note_by_id(
             return;
         }
         show_locked_placeholder(widgets);
+        update_note_quick_actions(state, widgets);
         if !prompt_if_locked {
             return;
         }
@@ -1773,12 +3732,18 @@ fn request_selection(
     let widgets = widgets.clone();
     let pending = pending.clone();
     let widgets_for_dispatch = widgets.clone();
+    let session = widgets.sessions.current();
     let source =
         glib::timeout_add_local_once(Duration::from_millis(SELECTION_DISPATCH_MS), move || {
             widgets_for_dispatch.select_source.replace(None);
             let Some(target) = widgets_for_dispatch.pending_select.take() else {
                 return;
             };
+            // A vault switch since the click was queued makes this dispatch
+            // stale - the target belonged to the previous vault's list.
+            if !widgets_for_dispatch.sessions.is_current(session) {
+                return;
+            }
             // The row may already be gone if the list was rebuilt since the click.
             if widgets_for_dispatch.selection.index_of(target).is_none() {
                 return;
@@ -1835,6 +3800,7 @@ fn cancel_pending_selection(widgets: &Widgets) {
 fn display_document(document: ActiveDocument, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     let title = document.note().metadata.title.clone();
     let body = document.note().body.clone();
+    let note_id = document.note().metadata.id;
     let encrypted = document.is_encrypted();
     {
         let mut state = state.borrow_mut();
@@ -1844,8 +3810,12 @@ fn display_document(document: ActiveDocument, state: &Rc<RefCell<AppState>>, wid
         state.title_draft = title.clone();
         state.body_dirty = false;
         state.title_dirty = false;
-        state.last_sensitive_activity = encrypted.then(Instant::now);
         state.active = Some(document);
+        state.last_sensitive_activity = None;
+        // "Recently Opened" tracks the user viewing a note - never its
+        // modification time, and this never rewrites the note file.
+        record_note_opened(&mut state, note_id);
+        touch_sensitive_activity(&mut state);
     }
     let _editor_guard = widgets.editor_events.suppress();
     widgets.title.set_sensitive(true);
@@ -1865,6 +3835,252 @@ fn display_document(document: ActiveDocument, state: &Rc<RefCell<AppState>>, wid
         "Saved"
     });
     render_active_tags(state, widgets);
+    update_note_quick_actions(state, widgets);
+}
+
+/// Shows/updates the note-header quick actions (lock, favourite, pin, overflow)
+/// for whatever note is in context. Hidden entirely when no note is selected.
+fn update_note_quick_actions(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    let (id, summary, has_active, active_encrypted, read_only) = {
+        let st = state.borrow();
+        let id = st
+            .active
+            .as_ref()
+            .map(ActiveDocument::id)
+            .or_else(|| st.flow.selected_note());
+        (
+            id,
+            id.and_then(|id| st.notes.iter().find(|s| s.id == id).cloned()),
+            st.active.is_some(),
+            st.active.as_ref().is_some_and(ActiveDocument::is_encrypted),
+            st.read_only,
+        )
+    };
+    let (Some(id), Some(summary)) = (id, summary) else {
+        set_quick_actions_visible(widgets, false);
+        return;
+    };
+    set_quick_actions_visible(widgets, true);
+
+    let locked_encrypted = summary.encrypted && !has_active;
+
+    let (icon, tip) = if active_encrypted {
+        ("changes-prevent-symbolic", "Lock Note")
+    } else if locked_encrypted {
+        ("changes-prevent-symbolic", "Unlock Note")
+    } else {
+        ("changes-allow-symbolic", "Encrypt Note")
+    };
+    widgets.note_lock_button.set_icon_name(icon);
+    widgets.note_lock_button.set_tooltip_text(Some(tip));
+    // Encrypting / locking need a writable vault; unlocking a locked note does
+    // not.
+    widgets
+        .note_lock_button
+        .set_sensitive(locked_encrypted || !read_only);
+
+    widgets
+        .note_favourite_button
+        .set_icon_name(if summary.favourite {
+            "starred-symbolic"
+        } else {
+            "non-starred-symbolic"
+        });
+    widgets
+        .note_favourite_button
+        .set_tooltip_text(Some(if summary.favourite {
+            "Remove from Favourites"
+        } else {
+            "Add to Favourites"
+        }));
+    toggle_css_class(
+        &widgets.note_favourite_button,
+        "brand-accent",
+        summary.favourite,
+    );
+    widgets
+        .note_favourite_button
+        .set_sensitive(!locked_encrypted && !read_only);
+
+    widgets
+        .note_pin_button
+        .set_tooltip_text(Some(if summary.pinned {
+            "Unpin Note"
+        } else {
+            "Pin Note"
+        }));
+    toggle_css_class(&widgets.note_pin_button, "brand-accent", summary.pinned);
+    widgets
+        .note_pin_button
+        .set_sensitive(!locked_encrypted && !read_only);
+
+    let menu = note_overflow_menu(id, &summary, has_active, read_only);
+    widgets.note_overflow_button.set_menu_model(Some(&menu));
+}
+
+fn set_quick_actions_visible(widgets: &Widgets, visible: bool) {
+    widgets.note_lock_button.set_visible(visible);
+    widgets.note_favourite_button.set_visible(visible);
+    widgets.note_pin_button.set_visible(visible);
+    widgets.note_overflow_button.set_visible(visible);
+}
+
+fn toggle_css_class(widget: &gtk::Button, class: &str, on: bool) {
+    if on {
+        widget.add_css_class(class);
+    } else {
+        widget.remove_css_class(class);
+    }
+}
+
+/// The note-header overflow menu: the uncommon actions that do not warrant a
+/// dedicated quick button. Favourite / Pin / ordinary Encrypt-Lock-Unlock are
+/// deliberately *not* here.
+fn note_overflow_menu(
+    id: Uuid,
+    summary: &NoteSummary,
+    has_active: bool,
+    read_only: bool,
+) -> gio::Menu {
+    let menu = gio::Menu::new();
+
+    let organise = gio::Menu::new();
+    if !read_only {
+        append_targeted_menu_item(&organise, "Rename", "app.context-rename", id);
+        append_targeted_menu_item(
+            &organise,
+            "Move to Notebook…",
+            "app.context-move-to-notebook",
+            id,
+        );
+    }
+    append_targeted_menu_item(
+        &organise,
+        if summary.archived {
+            "Unarchive"
+        } else {
+            "Archive"
+        },
+        "app.context-toggle-archived",
+        id,
+    );
+    if organise.n_items() > 0 {
+        menu.append_section(None, &organise);
+    }
+
+    let encryption = gio::Menu::new();
+    if summary.encrypted {
+        if has_active {
+            encryption.append(Some("Change Note Password…"), Some("app.change-password"));
+            encryption.append(
+                Some("Remove Note Encryption…"),
+                Some("app.remove-encryption"),
+            );
+        }
+    } else if !read_only {
+        append_targeted_menu_item(&encryption, "Encrypt Note…", "app.context-encrypt", id);
+    }
+    if encryption.n_items() > 0 {
+        menu.append_section(None, &encryption);
+    }
+
+    let info = gio::Menu::new();
+    append_targeted_menu_item(&info, "Note Information", "app.context-note-info", id);
+    menu.append_section(None, &info);
+
+    if !read_only {
+        let danger = gio::Menu::new();
+        append_targeted_menu_item(&danger, "Delete", "app.context-move-to-trash", id);
+        menu.append_section(None, &danger);
+    }
+    menu
+}
+
+/// Note-header lock quick action. Dispatches on the note's current state and is
+/// strictly note-level: it never calls [`lock_vault`].
+fn note_quick_lock(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let Some(id) = current_note_id(state) else {
+        return;
+    };
+    let (has_active, active_encrypted, summary_encrypted) = {
+        let st = state.borrow();
+        (
+            st.active.is_some(),
+            st.active.as_ref().is_some_and(ActiveDocument::is_encrypted),
+            st.notes
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.encrypted)
+                .unwrap_or(false),
+        )
+    };
+    if active_encrypted {
+        lock_active_note(state, widgets);
+    } else if has_active {
+        cancel_all_timers(pending);
+        encrypt_active_note(state, widgets);
+    } else if summary_encrypted {
+        open_note_by_id(id, state, widgets, true);
+    }
+}
+
+/// Locks only the currently open encrypted note. Leaves any other notes
+/// decrypted in the session cache untouched and never touches the vault key.
+fn lock_active_note(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+    if !persist_active(state, widgets, true) {
+        return;
+    }
+    let target = {
+        let mut st = state.borrow_mut();
+        if !st.active.as_ref().is_some_and(ActiveDocument::is_encrypted) {
+            return;
+        }
+        let Some(mut active) = st.active.take() else {
+            return;
+        };
+        let id = active.id();
+        let path = active.note().relative_path.clone();
+        active.clear_sensitive();
+        st.last_sensitive_activity = None;
+        (id, path)
+    };
+    {
+        let _editor_guard = widgets.editor_events.suppress();
+        widgets.title.set_text("");
+        set_buffer_text_silently(&widgets.buffer, "");
+    }
+    show_locked_placeholder(widgets);
+    widgets.save_status.set_label("Locked · encrypted at rest");
+
+    let (id, path) = target;
+    let locked_title = {
+        let mut st = state.borrow_mut();
+        st.notes.iter_mut().find(|s| s.id == id).map(|summary| {
+            *summary = NoteSummary::locked(id, path);
+            summary.title.clone()
+        })
+    };
+    let must_rebuild = matches!(
+        state.borrow().flow.view(),
+        ViewMode::Pinned | ViewMode::Favourites | ViewMode::Archive | ViewMode::RecentlyOpened
+    );
+    if must_rebuild {
+        render_note_list(state, widgets);
+    } else if let Some(title) = locked_title {
+        let row_widgets = { widgets.row_widgets.borrow().get(&id).cloned() };
+        if let Some(rw) = row_widgets {
+            rw.title.set_label(&title);
+            rw.preview.set_label("Encrypted — unlock to view");
+            rw.pin.set_visible(false);
+            rw.favourite.set_visible(false);
+            rw.archived.set_visible(false);
+        }
+    }
+    update_note_quick_actions(state, widgets);
 }
 
 fn show_locked_placeholder(widgets: &Widgets) {
@@ -1925,17 +4141,11 @@ fn schedule_body_save(
     }
     let has_active = {
         let mut state = state.borrow_mut();
-        if state.active.is_none() {
+        if state.active.is_none() || state.read_only {
             false
         } else {
             state.body_dirty = true;
-            if state
-                .active
-                .as_ref()
-                .is_some_and(ActiveDocument::is_encrypted)
-            {
-                state.last_sensitive_activity = Some(Instant::now());
-            }
+            touch_sensitive_activity(&mut state);
             true
         }
     };
@@ -1950,8 +4160,13 @@ fn schedule_body_save(
     let state_for_save = state.clone();
     let widgets_for_save = widgets.clone();
     let pending_for_save = pending.clone();
+    let session = widgets.sessions.current();
     let source = glib::timeout_add_local_once(Duration::from_millis(delay), move || {
         pending_for_save.borrow_mut().body.take();
+        // A vault switch since this timer was armed makes it stale.
+        if !widgets_for_save.sessions.is_current(session) {
+            return;
+        }
         persist_active(&state_for_save, &widgets_for_save, false);
     });
     pending.borrow_mut().body = Some(source);
@@ -1965,6 +4180,9 @@ fn schedule_title_commit(
     if let Some(source) = pending.borrow_mut().title.take() {
         source.remove();
     }
+    if state.borrow().read_only {
+        return;
+    }
     let delay = state
         .borrow()
         .config
@@ -1973,8 +4191,12 @@ fn schedule_title_commit(
     let state_for_save = state.clone();
     let widgets_for_save = widgets.clone();
     let pending_for_save = pending.clone();
+    let session = widgets.sessions.current();
     let source = glib::timeout_add_local_once(Duration::from_millis(delay), move || {
         pending_for_save.borrow_mut().title.take();
+        if !widgets_for_save.sessions.is_current(session) {
+            return;
+        }
         persist_active(&state_for_save, &widgets_for_save, true);
     });
     pending.borrow_mut().title = Some(source);
@@ -2032,6 +4254,24 @@ fn stash_or_lock_active(state: &Rc<RefCell<AppState>>) {
         state.plain_cache.insert(note.metadata.id, (note, stamp));
     } else {
         active.clear_sensitive();
+    }
+}
+
+/// Records "sensitive activity just happened" for the auto-lock timer, when
+/// either the open note is an encrypted `.snote` or the whole vault is an
+/// unlocked encrypted vault (in which case even a plaintext `.md` note in the
+/// editor is sensitive at rest).
+fn touch_sensitive_activity(state: &mut AppState) {
+    let sensitive = state
+        .active
+        .as_ref()
+        .is_some_and(ActiveDocument::is_encrypted)
+        || state
+            .vault
+            .as_ref()
+            .is_some_and(|vault| vault.is_encrypted() && !vault.is_locked());
+    if sensitive {
+        state.last_sensitive_activity = Some(Instant::now());
     }
 }
 
@@ -2179,6 +4419,7 @@ fn update_active_summary(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                 note.body.clone(),
                 note.relative_path.clone(),
                 note.metadata.pinned,
+                note.metadata.favourite,
                 note.metadata.archived,
                 note.metadata.created_at,
                 note.metadata.updated_at,
@@ -2186,7 +4427,7 @@ fn update_active_summary(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
             )
         })
     };
-    let Some((id, title, body, path, pinned, archived, created_at, updated_at, tags)) =
+    let Some((id, title, body, path, pinned, favourite, archived, created_at, updated_at, tags)) =
         active_snapshot
     else {
         return;
@@ -2210,6 +4451,7 @@ fn update_active_summary(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     {
         summary.relative_path = path;
         summary.pinned = pinned;
+        summary.favourite = favourite;
         summary.archived = archived;
         summary.created_at = created_at;
         summary.updated_at = updated_at;
@@ -2227,6 +4469,7 @@ fn update_active_summary(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     let row_widgets = { widgets.row_widgets.borrow().get(&id).cloned() };
     if let Some(row_widgets) = row_widgets {
         row_widgets.pin.set_visible(pinned);
+        row_widgets.favourite.set_visible(favourite);
         row_widgets.archived.set_visible(archived);
         row_widgets.title.set_label(&title);
         row_widgets.preview.set_label(&preview);
@@ -2313,6 +4556,7 @@ fn render_note_list(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                         preview: &subtitle,
                         encrypted: entry.encrypted,
                         pinned: false,
+                        favourite: false,
                         archived: false,
                         density,
                     },
@@ -2334,6 +4578,7 @@ fn render_note_list(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                         preview: &summary.preview,
                         encrypted: summary.encrypted,
                         pinned: summary.pinned,
+                        favourite: summary.favourite,
                         archived: summary.archived,
                         density,
                     },
@@ -2377,11 +4622,21 @@ fn render_note_list(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                     "No notes here",
                     "New notes you create here appear in this notebook.",
                 ),
+                ViewMode::RecentlyOpened => {
+                    ("Nothing opened yet", "Notes you open will appear here.")
+                }
+                ViewMode::Favourites => (
+                    "No favourites yet",
+                    "Mark a note with the star to see it here.",
+                ),
                 ViewMode::Pinned => ("No pinned notes", "Pin a note to see it here."),
-                ViewMode::RecentlyEdited => ("Nothing recent", "Notes you edit will appear here."),
                 ViewMode::Archive => (
                     "Nothing archived",
                     "Archive a note to remove it from your day-to-day views.",
+                ),
+                ViewMode::EncryptedNotes => (
+                    "No encrypted notes",
+                    "Encrypt a note with its own password to see it here.",
                 ),
                 ViewMode::Trash => ("Trash is empty", "Deleted notes will appear here."),
             }
@@ -2405,6 +4660,7 @@ fn insert_note_row(
             preview: &summary.preview,
             encrypted: summary.encrypted,
             pinned: summary.pinned,
+            favourite: summary.favourite,
             archived: summary.archived,
             density,
         },
@@ -2916,6 +5172,7 @@ struct NoteRowSpec<'a> {
     preview: &'a str,
     encrypted: bool,
     pinned: bool,
+    favourite: bool,
     archived: bool,
     density: NoteListDensity,
 }
@@ -2930,6 +5187,7 @@ fn note_row(
         preview: preview_text,
         encrypted,
         pinned,
+        favourite,
         archived,
         density,
     } = spec;
@@ -2951,7 +5209,13 @@ fn note_row(
         lock.add_css_class("brand-accent");
         title_row.append(&lock);
     }
-    let pin = gtk::Image::from_icon_name("emblem-favorite-symbolic");
+    let favourite_icon = gtk::Image::from_icon_name("starred-symbolic");
+    favourite_icon.set_pixel_size(14);
+    favourite_icon.set_visible(favourite);
+    favourite_icon.add_css_class("brand-accent");
+    favourite_icon.set_tooltip_text(Some("Favourite"));
+    title_row.append(&favourite_icon);
+    let pin = gtk::Image::from_icon_name("view-pin-symbolic");
     pin.set_pixel_size(14);
     pin.set_visible(pinned);
     pin.set_tooltip_text(Some("Pinned note"));
@@ -3018,6 +5282,7 @@ fn note_row(
             title,
             preview,
             pin,
+            favourite: favourite_icon,
             archived: archived_icon,
         },
     )
@@ -3030,6 +5295,12 @@ fn note_context_menu(id: Uuid, pinned: bool, archived: bool, encrypted: bool) ->
         &menu,
         if pinned { "Unpin" } else { "Pin" },
         "app.context-toggle-pin",
+        id,
+    );
+    append_targeted_menu_item(
+        &menu,
+        "Toggle Favourite",
+        "app.context-toggle-favourite",
         id,
     );
     append_targeted_menu_item(
@@ -3077,10 +5348,11 @@ fn append_targeted_menu_item(menu: &gio::Menu, label: &str, action: &str, id: Uu
 fn filtered_notes(state: &AppState, query: &str) -> Vec<NoteSummary> {
     let view = state.flow.view();
     let tag = state.filter.active_tag();
+    let recently_opened = &state.session.recently_opened;
     let mut notes: Vec<NoteSummary> = state
         .notes
         .iter()
-        .filter(|summary| view_includes(view, summary))
+        .filter(|summary| view_includes(view, summary, recently_opened))
         .filter(|summary| {
             tag.is_none_or(|tag| {
                 summary
@@ -3092,31 +5364,42 @@ fn filtered_notes(state: &AppState, query: &str) -> Vec<NoteSummary> {
         .filter(|summary| summary_matches(summary, query))
         .cloned()
         .collect();
-    if matches!(view, ViewMode::RecentlyEdited) {
-        // Recency defines this smart view regardless of the user's general
-        // sort preference elsewhere.
-        sort_notes(&mut notes, Some(SortOrder::LastEdited));
-    } else {
-        sort_notes(&mut notes, state.config.sort_order);
+    match view {
+        ViewMode::RecentlyOpened => {
+            // Order follows the recently-opened list (most-recent first),
+            // never the user's general sort preference.
+            let rank = |id: &Uuid| {
+                recently_opened
+                    .iter()
+                    .position(|candidate| candidate == id)
+                    .unwrap_or(usize::MAX)
+            };
+            notes.sort_by(|a, b| rank(&a.id).cmp(&rank(&b.id)).then(a.id.cmp(&b.id)));
+        }
+        _ => sort_notes(&mut notes, state.config.sort_order),
     }
     notes
 }
 
 /// Whether `summary` belongs in `view`. Every "day-to-day" view except
-/// Archive excludes archived notes; Recently Edited additionally excludes a
-/// currently-locked note, since SenatorialNotes cannot truthfully claim to
-/// know its edit recency without decrypting it (`NoteSummary::locked`).
-/// Notebook membership is exact - a notebook shows only notes directly
-/// inside it, never descendants of nested notebooks.
-fn view_includes(view: &ViewMode, summary: &NoteSummary) -> bool {
+/// Archive excludes archived notes. Notebook membership is exact - a notebook
+/// shows only notes directly inside it, never descendants of nested
+/// notebooks.
+fn view_includes(view: &ViewMode, summary: &NoteSummary, recently_opened: &[Uuid]) -> bool {
     match view {
         ViewMode::AllNotes => !summary.archived,
         ViewMode::Notebook(path) => {
             !summary.archived && summary.relative_path.parent() == Some(path.as_path())
         }
+        ViewMode::RecentlyOpened => {
+            !summary.archived && !summary.locked && recently_opened.contains(&summary.id)
+        }
+        ViewMode::Favourites => !summary.archived && summary.favourite,
         ViewMode::Pinned => !summary.archived && summary.pinned,
-        ViewMode::RecentlyEdited => !summary.archived && !summary.locked,
         ViewMode::Archive => summary.archived,
+        // Individually encrypted notes, archived or not - this is a "find my
+        // note-password-protected notes" view, not a day-to-day one.
+        ViewMode::EncryptedNotes => summary.encrypted,
         ViewMode::Trash => false,
     }
 }
@@ -3307,7 +5590,9 @@ fn move_note_by_id(id: Uuid, destination: &Path, state: &Rc<RefCell<AppState>>, 
                     .notes
                     .iter()
                     .find(|summary| summary.id == id)
-                    .is_some_and(|summary| view_includes(state.flow.view(), summary))
+                    .is_some_and(|summary| {
+                        view_includes(state.flow.view(), summary, &state.session.recently_opened)
+                    })
             };
             if still_visible {
                 render_note_list(state, widgets);
@@ -3419,6 +5704,7 @@ fn present_move_to_notebook_dialog(id: Uuid, state: &Rc<RefCell<AppState>>, widg
 #[derive(Clone, Copy)]
 enum NoteFlag {
     Pinned,
+    Favourite,
     Archived,
 }
 
@@ -3426,6 +5712,7 @@ impl NoteFlag {
     fn get(self, metadata: &NoteMetadata) -> bool {
         match self {
             Self::Pinned => metadata.pinned,
+            Self::Favourite => metadata.favourite,
             Self::Archived => metadata.archived,
         }
     }
@@ -3433,6 +5720,7 @@ impl NoteFlag {
     fn set(self, metadata: &mut NoteMetadata, value: bool) {
         match self {
             Self::Pinned => metadata.pinned = value,
+            Self::Favourite => metadata.favourite = value,
             Self::Archived => metadata.archived = value,
         }
     }
@@ -3440,6 +5728,7 @@ impl NoteFlag {
     fn action_name(self) -> &'static str {
         match self {
             Self::Pinned => "pinned",
+            Self::Favourite => "favourite",
             Self::Archived => "archived",
         }
     }
@@ -3447,6 +5736,7 @@ impl NoteFlag {
     fn status_labels(self) -> (&'static str, &'static str) {
         match self {
             Self::Pinned => ("Pinned", "Unpinned"),
+            Self::Favourite => ("Added to Favourites", "Removed from Favourites"),
             Self::Archived => ("Archived", "Unarchived"),
         }
     }
@@ -3557,9 +5847,13 @@ fn toggle_note_flag(flag: NoteFlag, id: Uuid, state: &Rc<RefCell<AppState>>, wid
     if let Some(updated) = updated {
         let now_set = match flag {
             NoteFlag::Pinned => updated.pinned,
+            NoteFlag::Favourite => updated.favourite,
             NoteFlag::Archived => updated.archived,
         };
-        let visible_in_current_view = { view_includes(state.borrow().flow.view(), &updated) };
+        let visible_in_current_view = {
+            let st = state.borrow();
+            view_includes(st.flow.view(), &updated, &st.session.recently_opened)
+        };
         if visible_in_current_view {
             replace_note_row(&updated, state, widgets);
         } else {
@@ -3574,6 +5868,7 @@ fn toggle_note_flag(flag: NoteFlag, id: Uuid, state: &Rc<RefCell<AppState>>, wid
             .save_status
             .set_label(if now_set { on_label } else { off_label });
         render_tags_list(state, widgets);
+        update_note_quick_actions(state, widgets);
     }
 }
 
@@ -3827,8 +6122,16 @@ fn install_watcher_poll(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
             let state = state.borrow();
             !state.body_dirty && !state.title_dirty
         };
+        // A locked encrypted vault has no in-memory plaintext to reconcile.
+        // External ciphertext churn is picked up by the full rescan that
+        // `enter_vault_workspace` runs on the next unlock; parsing the
+        // encrypted store here would be meaningless (and impossible).
+        let vault_locked = {
+            let state = state.borrow();
+            state.vault.as_ref().is_some_and(Vault::is_locked)
+        };
         match changed {
-            Some(Ok(true)) if editor_is_clean => {
+            Some(Ok(true)) if editor_is_clean && !vault_locked => {
                 // Distinguish our own just-committed atomic writes from real
                 // external edits with a cheap stat-only comparison. If the tree
                 // matches the baseline SenatorialNotes last wrote, the event is
@@ -3857,8 +6160,10 @@ fn install_watcher_poll(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     });
 }
 
-/// Cheap stat-only snapshot of the notes and trash trees: (path, mtime, length)
-/// for every `.md`/`.snote`/trash file, sorted. No file contents are read.
+/// Cheap stat-only snapshot of the directories the vault says to watch:
+/// (path, mtime, length) for every file, sorted. No file contents are read.
+/// For an ordinary vault these are the notes and trash trees; for an encrypted
+/// vault, the opaque ciphertext store. Encrypted payloads are never parsed.
 fn note_tree_snapshot(vault: &Vault) -> Vec<(std::path::PathBuf, std::time::SystemTime, u64)> {
     fn walk(directory: &Path, out: &mut Vec<(std::path::PathBuf, std::time::SystemTime, u64)>) {
         let Ok(entries) = std::fs::read_dir(directory) else {
@@ -3886,8 +6191,9 @@ fn note_tree_snapshot(vault: &Vault) -> Vec<(std::path::PathBuf, std::time::Syst
     }
 
     let mut out = Vec::new();
-    walk(&vault.notes_dir(), &mut out);
-    walk(&vault.trash_dir(), &mut out);
+    for directory in vault.watch_paths() {
+        walk(&directory, &mut out);
+    }
     out.sort();
     out
 }
@@ -4064,6 +6370,7 @@ fn refresh_after_watcher(
                     row_widgets.title.set_label(&summary.title);
                     row_widgets.preview.set_label(&summary.preview);
                     row_widgets.pin.set_visible(summary.pinned);
+                    row_widgets.favourite.set_visible(summary.favourite);
                     row_widgets.archived.set_visible(summary.archived);
                 }
             }
@@ -4086,10 +6393,15 @@ fn reselect_active_note(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     select_row_target(RowTarget::Note(id), widgets);
 }
 
-fn connect_locking_events(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
+fn connect_locking_events(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
     {
         let state = state.clone();
         let widgets = widgets.clone();
+        let pending = pending.clone();
         widgets
             .window
             .clone()
@@ -4100,12 +6412,14 @@ fn connect_locking_events(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                 let config = { state.borrow().config.encrypted_note_locking.clone() };
                 if config.on_focus_loss || config.on_minimize {
                     lock_all_encrypted(&state, &widgets);
+                    lock_vault(&state, &widgets, &pending);
                 }
             });
     }
     {
         let state = state.clone();
         let widgets = widgets.clone();
+        let pending = pending.clone();
         glib::timeout_add_local(Duration::from_secs(30), move || {
             let (minutes, last_sensitive_activity) = {
                 let state = state.borrow();
@@ -4119,6 +6433,7 @@ fn connect_locking_events(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                     .is_some_and(|last| last.elapsed() >= Duration::from_secs(minutes as u64 * 60));
             if expired {
                 lock_all_encrypted(&state, &widgets);
+                lock_vault(&state, &widgets, &pending);
             }
             glib::ControlFlow::Continue
         });
@@ -4179,7 +6494,7 @@ fn lock_all_encrypted(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     }
     let must_rebuild = matches!(
         state.borrow().flow.view(),
-        ViewMode::Pinned | ViewMode::Archive | ViewMode::RecentlyEdited
+        ViewMode::Pinned | ViewMode::Favourites | ViewMode::Archive | ViewMode::RecentlyOpened
     );
     if must_rebuild {
         // The note no longer qualifies for a protected-field smart view
@@ -4199,10 +6514,12 @@ fn lock_all_encrypted(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
                 }
                 row_widgets.preview.set_label("Encrypted — unlock to view");
                 row_widgets.pin.set_visible(false);
+                row_widgets.favourite.set_visible(false);
                 row_widgets.archived.set_visible(false);
             }
         }
     }
+    update_note_quick_actions(state, widgets);
 }
 
 fn encrypt_active_note(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
@@ -4275,6 +6592,128 @@ fn encrypt_active_note(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     );
 }
 
+/// Renames the currently open vault. **Display name only** - stored in
+/// `config.vault_index`; the folder, the vault, its manifest, and every
+/// encrypted blob (and their AAD) are untouched.
+fn rename_current_vault(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let (root, current) = {
+        let state = state.borrow();
+        let Some(vault) = state.vault.as_ref() else {
+            return;
+        };
+        let root = vault.root().to_path_buf();
+        let current = vault_display_name_for(&state.config, &root);
+        (root, current)
+    };
+
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    present_text_entry_dialog(
+        &widgets.window.clone(),
+        "Rename Vault",
+        "This changes only the name shown in SenatorialNotes. The folder on disk is not moved \
+         or renamed, and nothing is re-encrypted.",
+        "Vault name",
+        &current,
+        "Rename",
+        move |maybe_name| {
+            let Some(name) = maybe_name else {
+                return;
+            };
+            if name.trim().is_empty() {
+                return;
+            }
+            {
+                let mut state = state.borrow_mut();
+                state.config.set_vault_display_name(&root, &name);
+                let _ = state.config.save();
+            }
+            let display = { vault_display_name_for(&state.borrow().config, &root) };
+            widgets.vault_label.set_label(&display);
+            render_vault_switcher(&state, &widgets, &pending);
+        },
+    );
+}
+
+/// Changes the current Secure Vault's password. Only meaningful for an
+/// unlocked Secure Vault. The Argon2id re-wrap runs on a worker thread; the
+/// unlocked session stays valid (the vault master key does not change).
+fn change_vault_password_flow(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let (state_dir, vault_id) = {
+        let state = state.borrow();
+        let Some(vault) = state.vault.as_ref() else {
+            return;
+        };
+        if !vault.is_encrypted() || vault.is_locked() {
+            widgets
+                .save_status
+                .set_label("Unlock the Secure Vault before changing its password.");
+            return;
+        }
+        (vault.state_dir(), vault.vault_id())
+    };
+
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    present_change_password_dialog(
+        &widgets.window.clone(),
+        "Change Vault Password",
+        move |passwords| {
+            let Some((old_password, new_password)) = passwords else {
+                return;
+            };
+            let session = widgets.sessions.current();
+            widgets
+                .save_status
+                .set_label("Changing the vault password…");
+            let state_dir = state_dir.clone();
+            let worker = gio::spawn_blocking(move || -> senatorial_notes::Result<()> {
+                Vault::rewrap_encrypted_keyfile(
+                    &state_dir,
+                    vault_id,
+                    old_password.as_str(),
+                    new_password.as_str(),
+                )
+            });
+
+            let state = state.clone();
+            let widgets = widgets.clone();
+            let pending = pending.clone();
+            glib::spawn_future_local(async move {
+                let outcome = worker.await;
+                if !widgets.sessions.is_current(session) {
+                    return;
+                }
+                match outcome {
+                    Ok(Ok(())) => {
+                        widgets.save_status.set_label(
+                            "Vault password changed. Use it next time you unlock this vault.",
+                        );
+                        refresh_watch_baseline(&state);
+                        render_vault_switcher(&state, &widgets, &pending);
+                    }
+                    Ok(Err(error)) => widgets
+                        .save_status
+                        .set_label(&format!("The vault password was not changed: {error}")),
+                    Err(_) => widgets
+                        .save_status
+                        .set_label("The vault password change failed unexpectedly."),
+                }
+            });
+        },
+    );
+}
+
 fn change_active_password(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     if !persist_active(state, widgets, true) {
         return;
@@ -4294,7 +6733,7 @@ fn change_active_password(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     };
     let state_for_change = state.clone();
     let widgets_for_change = widgets.clone();
-    present_change_password_dialog(&widgets.window, move |passwords| {
+    present_change_password_dialog(&widgets.window, "Change Note Password", move |passwords| {
         let Some((old_password, new_password)) = passwords else {
             return;
         };
@@ -4678,14 +7117,14 @@ fn present_text_entry_dialog<F>(
     window.present();
 }
 
-fn present_change_password_dialog<F>(parent: &ApplicationWindow, callback: F)
+fn present_change_password_dialog<F>(parent: &ApplicationWindow, heading: &str, callback: F)
 where
     F: FnOnce(Option<(Zeroizing<String>, Zeroizing<String>)>) + 'static,
 {
     let window = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
-        .title("Change Password")
+        .title(heading)
         .default_width(430)
         .resizable(false)
         .build();
@@ -4693,7 +7132,7 @@ where
     header.set_show_start_title_buttons(false);
     header.set_show_end_title_buttons(false);
     let cancel = gtk::Button::with_label("Cancel");
-    let confirm = gtk::Button::with_label("Change Password");
+    let confirm = gtk::Button::with_label(heading);
     confirm.add_css_class("suggested-action");
     header.pack_start(&cancel);
     header.pack_end(&confirm);
@@ -5103,6 +7542,147 @@ fn format_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
     value.format("%Y-%m-%d %H:%M UTC").to_string()
 }
 
+/// A focused settings dialog for the open vault. A Secure Vault gets Auto-Lock,
+/// Security and General groups; a Standard Vault gets only the General group
+/// (display-name rename) and never any Secure-Vault security controls.
+fn show_vault_settings(
+    _application: &Application,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    _pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let (has_vault, is_secure) = {
+        let st = state.borrow();
+        st.vault
+            .as_ref()
+            .map(|vault| (true, vault.is_encrypted()))
+            .unwrap_or((false, false))
+    };
+    if !has_vault {
+        return;
+    }
+
+    let window = adw::PreferencesWindow::builder()
+        .transient_for(&widgets.window)
+        .modal(true)
+        .title(if is_secure {
+            "Secure Vault Settings"
+        } else {
+            "Vault Settings"
+        })
+        .search_enabled(false)
+        .default_width(460)
+        .default_height(if is_secure { 520 } else { 220 })
+        .build();
+    let page = adw::PreferencesPage::new();
+
+    if is_secure {
+        let current = { state.borrow().config.clone() };
+        let locking = current.encrypted_note_locking;
+
+        let auto_lock = adw::PreferencesGroup::builder()
+            .title("Auto-Lock")
+            .description(
+                "Automatically lock this Secure Vault (and any encrypted notes open in it).",
+            )
+            .build();
+
+        let after = adw::SpinRow::builder()
+            .title("Lock after inactivity")
+            .subtitle("Minutes of inactivity before locking — 0 turns this off")
+            .adjustment(&gtk::Adjustment::new(
+                locking.after_minutes as f64,
+                0.0,
+                240.0,
+                1.0,
+                5.0,
+                0.0,
+            ))
+            .build();
+        {
+            let state = state.clone();
+            let widgets = widgets.clone();
+            after.connect_value_notify(move |row| {
+                state
+                    .borrow_mut()
+                    .config
+                    .encrypted_note_locking
+                    .after_minutes = row.value() as u32;
+                save_and_apply_config(&state, &widgets);
+            });
+        }
+        auto_lock.add(&after);
+
+        let on_focus = adw::SwitchRow::builder()
+            .title("Lock when the app loses focus")
+            .active(locking.on_focus_loss)
+            .build();
+        {
+            let state = state.clone();
+            let widgets = widgets.clone();
+            on_focus.connect_active_notify(move |row| {
+                state
+                    .borrow_mut()
+                    .config
+                    .encrypted_note_locking
+                    .on_focus_loss = row.is_active();
+                save_and_apply_config(&state, &widgets);
+            });
+        }
+        auto_lock.add(&on_focus);
+
+        let on_minimize = adw::SwitchRow::builder()
+            .title("Lock when minimized")
+            .active(locking.on_minimize)
+            .build();
+        {
+            let state = state.clone();
+            let widgets = widgets.clone();
+            on_minimize.connect_active_notify(move |row| {
+                state.borrow_mut().config.encrypted_note_locking.on_minimize = row.is_active();
+                save_and_apply_config(&state, &widgets);
+            });
+        }
+        auto_lock.add(&on_minimize);
+        page.add(&auto_lock);
+
+        let security = adw::PreferencesGroup::builder().title("Security").build();
+        let change_password = adw::ActionRow::builder()
+            .title("Change Vault Password…")
+            .subtitle("Re-wraps the vault key; note contents are not re-encrypted")
+            .activatable(true)
+            .build();
+        change_password.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        {
+            let window = window.clone();
+            change_password.connect_activated(move |_| {
+                let _ = window.activate_action("app.change-vault-password", None);
+            });
+        }
+        security.add(&change_password);
+        page.add(&security);
+    }
+
+    let general = adw::PreferencesGroup::builder().title("General").build();
+    let rename = adw::ActionRow::builder()
+        .title("Rename Vault…")
+        .subtitle("Changes only the name shown in SenatorialNotes — the folder is not moved")
+        .activatable(true)
+        .build();
+    rename.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    {
+        let window = window.clone();
+        rename.connect_activated(move |_| {
+            let _ = window.activate_action("app.rename-vault", None);
+        });
+    }
+    general.add(&rename);
+    page.add(&general);
+
+    window.add(&page);
+    window.present();
+}
+
 fn show_preferences(application: &Application, state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     let window = ApplicationWindow::builder()
         .application(application)
@@ -5278,15 +7858,16 @@ fn show_preferences(application: &Application, state: &Rc<RefCell<AppState>>, wi
         });
     }
 
-    content.append(&preference_heading("Encrypted note locking"));
-    add_lock_switch(
-        &content,
-        "When switching away from the note",
-        current.encrypted_note_locking.on_note_switch,
-        state,
-        widgets,
-        |config, value| config.encrypted_note_locking.on_note_switch = value,
-    );
+    content.append(&preference_heading("Secure Vault Auto-Lock"));
+    let auto_lock_hint = gtk::Label::new(Some(
+        "Automatically lock a Secure Vault (and any encrypted notes open in it) after \
+         inactivity, focus loss, or minimize.",
+    ));
+    auto_lock_hint.set_wrap(true);
+    auto_lock_hint.set_xalign(0.0);
+    auto_lock_hint.add_css_class("dim-label");
+    auto_lock_hint.add_css_class("caption");
+    content.append(&auto_lock_hint);
     add_lock_switch(
         &content,
         "When the application loses focus",
@@ -5316,6 +7897,23 @@ fn show_preferences(application: &Application, state: &Rc<RefCell<AppState>>, wi
         .valign(gtk::Align::Center)
         .build();
     content.append(&preference_row("When the application exits", &exits));
+
+    content.append(&preference_heading("Encrypted Note Locking"));
+    let note_lock_hint =
+        gtk::Label::new(Some("Applies to notes that have their own note password."));
+    note_lock_hint.set_wrap(true);
+    note_lock_hint.set_xalign(0.0);
+    note_lock_hint.add_css_class("dim-label");
+    note_lock_hint.add_css_class("caption");
+    content.append(&note_lock_hint);
+    add_lock_switch(
+        &content,
+        "When switching away from the note",
+        current.encrypted_note_locking.on_note_switch,
+        state,
+        widgets,
+        |config, value| config.encrypted_note_locking.on_note_switch = value,
+    );
 
     content.append(&preference_heading("Privacy"));
     let privacy = gtk::Label::new(Some(PRIVACY_STATEMENT));
@@ -5448,34 +8046,33 @@ fn install_actions(
         let widgets = widgets.clone();
         let pending = pending.clone();
         open.connect_activate(move |_, _| {
-            if !prepare_to_leave_active(&state, &widgets, &pending) {
-                return;
-            }
-            let dialog = gtk::FileDialog::builder()
-                .title("Open a SenatorialNotes Vault")
-                .modal(true)
-                .build();
-            let state = state.clone();
-            let widgets = widgets.clone();
-            let parent = widgets.window.clone();
-            dialog.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
-                match result {
-                    Ok(folder) => match folder.path() {
-                        Some(path) => open_vault(&path, false, &state, &widgets),
-                        None => {
-                            show_welcome_error(&widgets, "The selected folder is not a local path.")
-                        }
-                    },
-                    Err(error) if !error.matches(gio::IOErrorEnum::Cancelled) => {
-                        show_welcome_error(&widgets, &format!("Folder selection failed: {error}"));
-                    }
-                    Err(_) => {}
-                }
-            });
+            present_vault_folder_picker(false, &state, &widgets, &pending);
         });
     }
     application.add_action(&open);
     application.set_accels_for_action("app.open-vault", &["<Primary>o"]);
+
+    let create_vault = gio::SimpleAction::new("create-vault", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        create_vault.connect_activate(move |_, _| {
+            present_vault_folder_picker(true, &state, &widgets, &pending);
+        });
+    }
+    application.add_action(&create_vault);
+
+    let create_encrypted_vault = gio::SimpleAction::new("create-encrypted-vault", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        create_encrypted_vault.connect_activate(move |_, _| {
+            present_encrypted_vault_creator(&state, &widgets, &pending);
+        });
+    }
+    application.add_action(&create_encrypted_vault);
 
     let preferences = gio::SimpleAction::new("preferences", None);
     {
@@ -5486,6 +8083,21 @@ fn install_actions(
     }
     application.add_action(&preferences);
     application.set_accels_for_action("app.preferences", &["<Primary>comma"]);
+
+    // A focused, per-vault settings dialog. For a Secure Vault it carries the
+    // Auto-Lock, Security and General groups; for a Standard Vault it is just
+    // the display-name rename - never any Secure-Vault security controls.
+    let vault_settings = gio::SimpleAction::new("vault-settings", None);
+    {
+        let application = application.clone();
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        vault_settings.connect_activate(move |_, _| {
+            show_vault_settings(&application, &state, &widgets, &pending)
+        });
+    }
+    application.add_action(&vault_settings);
 
     let focus_search = gio::SimpleAction::new("focus-search", None);
     {
@@ -5638,17 +8250,33 @@ fn install_actions(
     }
     application.add_action(&encrypt);
 
-    let lock = gio::SimpleAction::new("lock-now", None);
+    // Vault-level: lock the whole Secure Vault. Disabled (and so not
+    // invokable) unless the current vault is an unlocked Secure Vault.
+    let lock_vault_action = gio::SimpleAction::new("lock-vault", None);
     {
         let state = state.clone();
         let widgets = widgets.clone();
         let pending = pending.clone();
-        lock.connect_activate(move |_, _| {
+        lock_vault_action.connect_activate(move |_, _| {
+            cancel_all_timers(&pending);
+            lock_vault(&state, &widgets, &pending);
+        });
+    }
+    application.add_action(&lock_vault_action);
+
+    // Note-level: lock any individually encrypted notes that are currently
+    // unlocked in this session. Never touches the Secure Vault key.
+    let lock_note_action = gio::SimpleAction::new("lock-note", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        lock_note_action.connect_activate(move |_, _| {
             cancel_all_timers(&pending);
             lock_all_encrypted(&state, &widgets);
         });
     }
-    application.add_action(&lock);
+    application.add_action(&lock_note_action);
 
     let change_password = gio::SimpleAction::new("change-password", None);
     {
@@ -5661,6 +8289,29 @@ fn install_actions(
         });
     }
     application.add_action(&change_password);
+
+    let change_vault_password = gio::SimpleAction::new("change-vault-password", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        change_vault_password.connect_activate(move |_, _| {
+            cancel_all_timers(&pending);
+            change_vault_password_flow(&state, &widgets, &pending);
+        });
+    }
+    application.add_action(&change_vault_password);
+
+    let rename_vault = gio::SimpleAction::new("rename-vault", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        rename_vault.connect_activate(move |_, _| {
+            rename_current_vault(&state, &widgets, &pending);
+        });
+    }
+    application.add_action(&rename_vault);
 
     let remove_encryption = gio::SimpleAction::new("remove-encryption", None);
     {
@@ -5699,6 +8350,19 @@ fn install_actions(
         });
     }
     application.add_action(&context_toggle_pin);
+
+    let context_toggle_favourite =
+        gio::SimpleAction::new("context-toggle-favourite", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        context_toggle_favourite.connect_activate(move |_, parameter| {
+            if let Some(id) = uuid_parameter(parameter) {
+                toggle_note_flag(NoteFlag::Favourite, id, &state, &widgets);
+            }
+        });
+    }
+    application.add_action(&context_toggle_favourite);
 
     let context_toggle_archived =
         gio::SimpleAction::new("context-toggle-archived", Some(glib::VariantTy::STRING));
@@ -6343,4 +9007,51 @@ fn show_welcome_error(widgets: &Widgets, message: &str) {
     widgets.welcome_status.set_label(message);
     widgets.welcome_status.add_css_class("error");
     widgets.stack.set_visible_child_name("welcome");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_token_round_trips_every_view() {
+        for view in [
+            ViewMode::AllNotes,
+            ViewMode::Pinned,
+            ViewMode::RecentlyOpened,
+            ViewMode::Favourites,
+            ViewMode::Archive,
+            ViewMode::Trash,
+            ViewMode::Notebook(PathBuf::from("Inbox")),
+            ViewMode::Notebook(PathBuf::from("Work/Projects")),
+        ] {
+            let token = view_token(&view);
+            assert_eq!(
+                parse_view_token(&token),
+                Some(view.clone()),
+                "token {token:?} must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_view_token_rejects_garbage_and_falls_back_to_none() {
+        assert_eq!(parse_view_token(""), None);
+        assert_eq!(parse_view_token("not-a-view"), None);
+        // A notebook token always parses (existence is checked separately by
+        // `resolve_restored_view`).
+        assert_eq!(
+            parse_view_token("notebook:Anything/Here"),
+            Some(ViewMode::Notebook(PathBuf::from("Anything/Here")))
+        );
+    }
+
+    #[test]
+    fn vault_display_name_uses_the_folder_name() {
+        assert_eq!(
+            vault_display_name(Path::new("/home/user/My Notes")),
+            "My Notes"
+        );
+        assert_eq!(vault_display_name(Path::new("/")), APP_NAME);
+    }
 }

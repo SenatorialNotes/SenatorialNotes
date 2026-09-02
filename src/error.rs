@@ -63,6 +63,32 @@ pub enum Error {
 
     #[error("{relative_path} is a reserved notebook and cannot be renamed or deleted")]
     ReservedNotebook { relative_path: PathBuf },
+
+    #[error(
+        "this vault was created by a newer version of SenatorialNotes (manifest format {found}; this build supports up to {supported})"
+    )]
+    UnsupportedVaultVersion { found: u32, supported: u32 },
+
+    #[error("the vault manifest is missing or unreadable: {0}")]
+    VaultManifestCorrupt(String),
+
+    #[error("encrypted vaults are not supported by this build")]
+    UnsupportedVaultKind,
+
+    #[error("this vault is open read-only and cannot be modified")]
+    VaultReadOnly,
+
+    #[error("this encrypted vault is locked")]
+    VaultLocked,
+
+    #[error("invalid encrypted vault: {0}")]
+    InvalidEncryptedVault(String),
+
+    #[error(
+        "{0} already contains a vault or plaintext notes; an encrypted vault can only be created \
+         in an empty folder (converting an existing vault is not supported in this release)"
+    )]
+    EncryptedVaultTargetNotEmpty(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

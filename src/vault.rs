@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::constants::VAULT_STATE_DIR;
+use crate::crypto::vault::VaultKeys;
 use crate::crypto::{self, EncryptedSession};
 use crate::error::io_error;
 use crate::model::{Note, NoteSummary, locked_note_suffix};
@@ -16,16 +17,37 @@ use crate::paths::{
     validate_notebook_path,
 };
 use crate::storage::atomic::{atomic_write, rename_no_replace};
+use crate::vault_encrypted::{self, EncryptedStore};
+use crate::vault_manifest::{self, Migration, VaultKind, VaultManifest};
 use crate::{Error, Result};
 
 const NOTES_DIR: &str = "Notes";
 const ATTACHMENTS_DIR: &str = "Attachments";
 const TRASH_DIR: &str = "Trash";
-const DEFAULT_NOTEBOOK: &str = "Inbox";
+pub(crate) const DEFAULT_NOTEBOOK: &str = "Inbox";
+
+#[derive(Clone, Debug)]
+enum Backend {
+    /// Plaintext Markdown / `.snote` files under `Notes/` (v0.1–v0.2 layout).
+    Plain,
+    /// Whole-vault encryption (Stage D): opaque `SNENC` blobs + an encrypted
+    /// manifest under `.senatorial-notes/store/`. Starts **locked**.
+    Encrypted(EncryptedStore),
+}
 
 #[derive(Clone, Debug)]
 pub struct Vault {
     root: PathBuf,
+    manifest: VaultManifest,
+    migration: Migration,
+    /// `true` when this vault must not be modified during the session. Set when
+    /// a v1 → v2 manifest migration could not be persisted (a read-only vault):
+    /// every mutating operation then fails with [`Error::VaultReadOnly`] before
+    /// touching the filesystem, so the on-disk manifest version and the note
+    /// tree can never drift apart. Stage B's vault lock will reuse this flag for
+    /// "Open read-only".
+    read_only: bool,
+    backend: Backend,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,13 +94,6 @@ pub struct TrashEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct VaultManifest {
-    format_version: u32,
-    vault_id: Uuid,
-    created_at: chrono::DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 struct TrashRecord {
     format_version: u32,
     note_id: Uuid,
@@ -88,38 +103,235 @@ struct TrashRecord {
 }
 
 impl Vault {
+    /// Opens the vault at `root`, creating a fresh one if `root` has no
+    /// manifest yet.
+    ///
+    /// An existing manifest is validated and, if it is a v1 manifest, migrated
+    /// in place to v2 `Ordinary` **before** any directory or note file is
+    /// touched (see [`VaultManifest::load`]). A `format_version` newer than this
+    /// build supports, a corrupt manifest, or a `kind = "encrypted"` vault are
+    /// all refused here without modifying anything on disk.
     pub fn create(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         create_private_directory(root)?;
-        let vault = Self {
-            root: root.to_path_buf(),
-        };
+        let state_dir = root.join(VAULT_STATE_DIR);
 
-        for directory in [
-            vault.notes_dir(),
-            vault.notes_dir().join(DEFAULT_NOTEBOOK),
-            vault.attachments_dir(),
-            vault.trash_dir(),
-            vault.state_dir(),
-            vault.history_dir(),
-            vault.recovery_dir(),
-        ] {
-            create_private_directory(&directory)?;
-        }
+        if vault_manifest::manifest_path(&state_dir).exists() {
+            let outcome = VaultManifest::load(&state_dir)?;
 
-        let manifest_path = vault.state_dir().join("vault.toml");
-        if !manifest_path.exists() {
-            let manifest = VaultManifest {
-                format_version: 1,
-                vault_id: Uuid::new_v4(),
-                created_at: Utc::now(),
+            if outcome.manifest.kind == VaultKind::Encrypted {
+                // An encrypted vault must be a v3 manifest with an [encryption]
+                // table; a v2 `kind = "encrypted"` is a malformed hand-edit.
+                if outcome.manifest.format_version != vault_manifest::ENCRYPTED_MANIFEST_VERSION {
+                    return Err(Error::UnsupportedVaultKind);
+                }
+                let store = EncryptedStore::open(&state_dir, outcome.manifest.vault_id)?;
+                return Ok(Self {
+                    root: root.to_path_buf(),
+                    manifest: outcome.manifest,
+                    migration: outcome.migration,
+                    read_only: false,
+                    backend: Backend::Encrypted(store),
+                });
+            }
+
+            // A migration that could not be written back means the vault is
+            // read-only: it opens, but no mutating operation may run this
+            // session (see `read_only` and `ensure_writable`).
+            let read_only = matches!(outcome.migration, Migration::InMemoryOnly { .. });
+            let vault = Self {
+                root: root.to_path_buf(),
+                manifest: outcome.manifest,
+                migration: outcome.migration,
+                read_only,
+                backend: Backend::Plain,
             };
-            let contents = toml::to_string_pretty(&manifest)
-                .map_err(|error| Error::Configuration(error.to_string()))?;
-            atomic_write(&manifest_path, contents.as_bytes())?;
+            // Never create or repair the directory tree for a read-only vault -
+            // that would be a partial, mixed on-disk change the session is not
+            // allowed to make. A genuine read-only vault (a backup, a read-only
+            // mount) already has its tree.
+            if !read_only {
+                vault.ensure_directories()?;
+            }
+            Ok(vault)
+        } else {
+            let vault = Self {
+                root: root.to_path_buf(),
+                manifest: VaultManifest::new_ordinary(),
+                migration: Migration::NotNeeded,
+                read_only: false,
+                backend: Backend::Plain,
+            };
+            vault.ensure_directories()?;
+            vault_manifest::write(&vault.state_dir(), &vault.manifest)?;
+            Ok(vault)
         }
+    }
 
-        Ok(vault)
+    /// Creates a fresh **encrypted** vault protected by `password`. The returned
+    /// vault is unlocked. (The Argon2id work happens in `create_keyfile`; a GUI
+    /// caller should run it on a worker thread via
+    /// [`crypto::vault::create_keyfile`](crate::crypto::vault::create_keyfile)
+    /// and then [`Vault::finish_create_encrypted`].)
+    pub fn create_encrypted(root: impl AsRef<Path>, password: &str) -> Result<Self> {
+        let root = root.as_ref();
+        ensure_encrypted_target_is_clean(root)?;
+        check_password_policy(password)?;
+        let vault_id = Uuid::new_v4();
+        let (keyfile_bytes, keys) = crate::crypto::vault::create_keyfile(vault_id, password)?;
+        Self::finish_create_encrypted(root, vault_id, &keyfile_bytes, keys)
+    }
+
+    /// Validates that `root` can host a *new* encrypted vault: it must not
+    /// already be a vault of either kind and must not contain plaintext note
+    /// storage (`Notes/` / `Trash/` / `Attachments/`, a `.senatorial-notes/`
+    /// directory, or any `.md` / `.snote` file). Callers that build an
+    /// encrypted vault outside `create_encrypted` (the GUI runs key derivation
+    /// on a worker thread and calls [`Vault::finish_create_encrypted`]
+    /// directly) can run this check up front.
+    ///
+    /// In-place conversion of an existing vault is intentionally not supported
+    /// in this release; stamping an encrypted keyfile onto an existing
+    /// ordinary vault would leave its notes in plaintext.
+    pub fn check_encrypted_target(root: impl AsRef<Path>) -> Result<()> {
+        ensure_encrypted_target_is_clean(root.as_ref())
+    }
+
+    /// Finishes creating an encrypted vault with key material derived elsewhere
+    /// (off the GUI main thread).
+    pub fn finish_create_encrypted(
+        root: impl AsRef<Path>,
+        vault_id: Uuid,
+        keyfile_bytes: &[u8],
+        keys: VaultKeys,
+    ) -> Result<Self> {
+        let root = root.as_ref();
+        // Enforced here too, not only in `create_encrypted`: the GUI derives
+        // the key material on a worker thread and calls this directly, so this
+        // is the real guard against encrypting on top of an existing vault.
+        ensure_encrypted_target_is_clean(root)?;
+        create_private_directory(root)?;
+        let state_dir = root.join(VAULT_STATE_DIR);
+        create_private_directory(&state_dir)?;
+
+        let store = EncryptedStore::create_from(&state_dir, vault_id, keyfile_bytes, keys)?;
+        let manifest = VaultManifest::new_encrypted(vault_id, vault_encrypted::KEYFILE_NAME);
+        vault_manifest::write(&state_dir, &manifest)?;
+
+        Ok(Self {
+            root: root.to_path_buf(),
+            manifest,
+            migration: Migration::NotNeeded,
+            read_only: false,
+            backend: Backend::Encrypted(store),
+        })
+    }
+
+    /// Whether this vault uses whole-vault encryption.
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.backend, Backend::Encrypted(_))
+    }
+
+    /// Whether this is an encrypted vault that is not currently unlocked.
+    pub fn is_locked(&self) -> bool {
+        match &self.backend {
+            Backend::Plain => false,
+            Backend::Encrypted(store) => !store.is_unlocked(),
+        }
+    }
+
+    /// The raw `vault.keys` bytes, for deriving key material on a worker thread.
+    pub fn encrypted_keyfile(&self) -> Result<Vec<u8>> {
+        match &self.backend {
+            Backend::Encrypted(store) => store.keyfile_bytes(),
+            Backend::Plain => Err(Error::InvalidEncryptedVault(
+                "not an encrypted vault".into(),
+            )),
+        }
+    }
+
+    /// Completes an unlock with key material derived off the main thread.
+    pub fn finish_unlock(&self, keys: VaultKeys) -> Result<()> {
+        match &self.backend {
+            Backend::Encrypted(store) => store.finish_unlock(keys),
+            Backend::Plain => Err(Error::InvalidEncryptedVault(
+                "not an encrypted vault".into(),
+            )),
+        }
+    }
+
+    /// Unlocks an encrypted vault (derives the KEK inline — tests / non-GUI).
+    pub fn unlock(&self, password: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Encrypted(store) => store.unlock(password),
+            Backend::Plain => Err(Error::InvalidEncryptedVault(
+                "not an encrypted vault".into(),
+            )),
+        }
+    }
+
+    /// Drops all in-memory key material and cached plaintext for an encrypted
+    /// vault. A no-op for an ordinary vault.
+    pub fn lock(&self) {
+        if let Backend::Encrypted(store) = &self.backend {
+            store.lock();
+        }
+    }
+
+    /// Changes an encrypted vault's password by re-wrapping the VMK only (no
+    /// object blob is re-encrypted).
+    pub fn change_vault_password(&self, old_password: &str, new_password: &str) -> Result<()> {
+        self.ensure_writable()?;
+        match &self.backend {
+            Backend::Encrypted(store) => store.change_password(old_password, new_password),
+            Backend::Plain => Err(Error::InvalidEncryptedVault(
+                "not an encrypted vault".into(),
+            )),
+        }
+    }
+
+    /// Re-wraps the vault master key in an encrypted vault's keyfile under a new
+    /// password. An associated function taking only `Send` values so the GUI
+    /// can run the Argon2id work on a worker thread; the in-memory unlocked
+    /// session stays valid afterwards (the VMK does not change). `state_dir` is
+    /// [`Vault::state_dir`] of an encrypted, unlocked vault.
+    pub fn rewrap_encrypted_keyfile(
+        state_dir: &Path,
+        vault_id: Uuid,
+        old_password: &str,
+        new_password: &str,
+    ) -> Result<()> {
+        vault_encrypted::rewrap_vault_keyfile(state_dir, vault_id, old_password, new_password)
+    }
+
+    /// The persisted per-vault session state for a Secure Vault (sealed inside
+    /// its manifest). `None` for an ordinary vault (its session state lives in
+    /// the app config) or a locked one.
+    pub fn encrypted_session_state(&self) -> Option<crate::config::VaultSessionState> {
+        match &self.backend {
+            Backend::Encrypted(store) => store.session_state().ok(),
+            Backend::Plain => None,
+        }
+    }
+
+    /// Persists per-vault session state into a Secure Vault's sealed manifest.
+    /// A no-op for an ordinary vault (nothing plaintext is written).
+    pub fn set_encrypted_session_state(
+        &self,
+        session: crate::config::VaultSessionState,
+    ) -> Result<()> {
+        match &self.backend {
+            Backend::Encrypted(store) => store.set_session_state(session),
+            Backend::Plain => Ok(()),
+        }
+    }
+
+    /// The directories the filesystem watcher should snapshot for this vault.
+    pub fn watch_paths(&self) -> Vec<PathBuf> {
+        match &self.backend {
+            Backend::Plain => vec![self.notes_dir(), self.trash_dir()],
+            Backend::Encrypted(store) => store.watch_paths(),
+        }
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -130,8 +342,66 @@ impl Vault {
         Self::create(root)
     }
 
+    /// Creates the vault's standard directory tree if any part is missing.
+    /// Existing directories (and their permissions) are left untouched.
+    fn ensure_directories(&self) -> Result<()> {
+        for directory in [
+            self.notes_dir(),
+            self.notes_dir().join(DEFAULT_NOTEBOOK),
+            self.attachments_dir(),
+            self.trash_dir(),
+            self.state_dir(),
+            self.history_dir(),
+            self.recovery_dir(),
+        ] {
+            create_private_directory(&directory)?;
+        }
+        Ok(())
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// This vault's stable UUID (from `vault.toml`).
+    pub fn vault_id(&self) -> Uuid {
+        self.manifest.vault_id
+    }
+
+    /// Whether this vault is ordinary or encrypted. Always `Ordinary` in this
+    /// build (an encrypted vault is refused at open time).
+    pub fn kind(&self) -> VaultKind {
+        self.manifest.kind
+    }
+
+    /// The parsed manifest.
+    pub fn manifest(&self) -> &VaultManifest {
+        &self.manifest
+    }
+
+    /// What opening this vault did to its manifest (a v1 → v2 upgrade, or
+    /// nothing). [`Migration::warning`] yields a user-facing message when the
+    /// upgrade could not be persisted.
+    pub fn migration(&self) -> &Migration {
+        &self.migration
+    }
+
+    /// Whether this vault is open read-only. Currently `true` only when a
+    /// manifest migration could not be persisted; every mutating method returns
+    /// [`Error::VaultReadOnly`] while this holds.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Guard at the top of every mutating operation.
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::VaultReadOnly);
+        }
+        if self.is_locked() {
+            return Err(Error::VaultLocked);
+        }
+        Ok(())
     }
 
     pub fn notes_dir(&self) -> PathBuf {
@@ -159,6 +429,10 @@ impl Vault {
     }
 
     pub fn create_notebook(&self, relative: impl AsRef<Path>) -> Result<PathBuf> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.create_notebook(relative.as_ref());
+        }
         let relative = validate_notebook_path(relative.as_ref())?;
         reject_symlink_components(&self.notes_dir(), &relative)?;
         let path = self.notes_dir().join(relative);
@@ -177,6 +451,9 @@ impl Vault {
     /// of relative paths with their direct (non-recursive) note counts.
     /// Symbolic links are skipped, matching `scan_notes`.
     pub fn list_notebooks(&self) -> Result<Vec<NotebookEntry>> {
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.list_notebooks();
+        }
         let mut notebooks = Vec::new();
         collect_notebooks(&self.notes_dir(), Path::new(""), &mut notebooks)?;
         notebooks.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -189,6 +466,10 @@ impl Vault {
     /// collide with an existing sibling, and on a name that would collide
     /// with the reserved `Inbox` name.
     pub fn rename_notebook(&self, relative: &Path, new_name: &str) -> Result<PathBuf> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.rename_notebook(relative, new_name);
+        }
         let relative = validate_notebook_path(relative)?;
         if Self::is_reserved_notebook(&relative) {
             return Err(Error::ReservedNotebook {
@@ -238,6 +519,10 @@ impl Vault {
     /// which gives a second safety net for free: `fs::remove_dir` itself
     /// fails on anything that is not empty.
     pub fn delete_notebook(&self, relative: &Path) -> Result<()> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.delete_notebook(relative);
+        }
         let relative = validate_notebook_path(relative)?;
         if Self::is_reserved_notebook(&relative) {
             return Err(Error::ReservedNotebook {
@@ -290,6 +575,10 @@ impl Vault {
         relative: &Path,
         destination_notebook: impl AsRef<Path>,
     ) -> Result<PathBuf> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.move_note(relative, destination_notebook.as_ref());
+        }
         let relative = ensure_relative_note_path(relative)?;
         let source = self.note_path(&relative)?;
         if !source.is_file() {
@@ -323,6 +612,10 @@ impl Vault {
     }
 
     pub fn create_note(&self, title: &str, notebook: impl AsRef<Path>) -> Result<Note> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.create_note(title, notebook.as_ref());
+        }
         let notebook = validate_notebook_path(notebook.as_ref())?;
         self.create_notebook(&notebook)?;
         let metadata = crate::model::NoteMetadata::new(title);
@@ -341,6 +634,9 @@ impl Vault {
     }
 
     pub fn load_note(&self, relative: impl AsRef<Path>) -> Result<(Note, FileStamp)> {
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.load_note(relative.as_ref());
+        }
         let relative = ensure_relative_note_path(relative.as_ref())?;
         if relative.extension().and_then(|value| value.to_str()) != Some("md") {
             return Err(Error::WrongNoteType);
@@ -357,6 +653,9 @@ impl Vault {
         relative: impl AsRef<Path>,
         password: &str,
     ) -> Result<(Note, FileStamp, EncryptedSession)> {
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.load_encrypted_note(relative.as_ref(), password);
+        }
         let relative = ensure_relative_note_path(relative.as_ref())?;
         if relative.extension().and_then(|value| value.to_str()) != Some("snote") {
             return Err(Error::WrongNoteType);
@@ -371,6 +670,10 @@ impl Vault {
     /// Saves body/metadata to the existing Markdown path without renaming it.
     /// Title commits are deliberately handled by `commit_title`.
     pub fn save_note(&self, note: &mut Note, expected: Option<&FileStamp>) -> Result<FileStamp> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.save_note(note, expected);
+        }
         if note
             .relative_path
             .extension()
@@ -396,6 +699,10 @@ impl Vault {
         expected: Option<&FileStamp>,
         title: &str,
     ) -> Result<FileStamp> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.commit_title(note, expected, title);
+        }
         if note
             .relative_path
             .extension()
@@ -442,6 +749,10 @@ impl Vault {
         expected: Option<&FileStamp>,
         password: &str,
     ) -> Result<(FileStamp, EncryptedSession)> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.encrypt_note(note, expected, password);
+        }
         if note
             .relative_path
             .extension()
@@ -486,6 +797,10 @@ impl Vault {
         session: &EncryptedSession,
         expected: Option<&FileStamp>,
     ) -> Result<FileStamp> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.save_encrypted_note(note, session, expected);
+        }
         if note
             .relative_path
             .extension()
@@ -518,6 +833,10 @@ impl Vault {
         old_password: &str,
         new_password: &str,
     ) -> Result<(Note, FileStamp, EncryptedSession)> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.change_encrypted_password(relative.as_ref(), old_password, new_password);
+        }
         let relative = ensure_relative_note_path(relative.as_ref())?;
         if relative.extension().and_then(|value| value.to_str()) != Some("snote") {
             return Err(Error::WrongNoteType);
@@ -548,6 +867,10 @@ impl Vault {
         relative: impl AsRef<Path>,
         password: &str,
     ) -> Result<(Note, FileStamp)> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.remove_encryption(relative.as_ref(), password);
+        }
         let relative = ensure_relative_note_path(relative.as_ref())?;
         if relative.extension().and_then(|value| value.to_str()) != Some("snote") {
             return Err(Error::WrongNoteType);
@@ -577,6 +900,10 @@ impl Vault {
     }
 
     pub fn write_recovery(&self, note: &Note) -> Result<PathBuf> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.write_recovery(note);
+        }
         if note
             .relative_path
             .extension()
@@ -592,6 +919,9 @@ impl Vault {
     }
 
     pub fn scan_notes(&self) -> Result<Vec<NoteSummary>> {
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.scan_notes();
+        }
         let mut notes = Vec::new();
         self.scan_directory(&self.notes_dir(), &mut notes)?;
         // `None` is the shared default comparator (pinned-first, then
@@ -602,6 +932,10 @@ impl Vault {
     }
 
     pub fn move_to_trash(&self, relative: impl AsRef<Path>) -> Result<TrashEntry> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.move_to_trash(relative.as_ref());
+        }
         let relative = ensure_relative_note_path(relative.as_ref())?;
         let source = self.note_path(&relative)?;
         let encrypted = relative.extension().and_then(|value| value.to_str()) == Some("snote");
@@ -648,6 +982,9 @@ impl Vault {
     }
 
     pub fn scan_trash(&self) -> Result<Vec<TrashEntry>> {
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.scan_trash();
+        }
         let mut entries = Vec::new();
         for directory_entry in
             fs::read_dir(self.trash_dir()).map_err(|error| io_error(self.trash_dir(), error))?
@@ -692,6 +1029,10 @@ impl Vault {
     }
 
     pub fn restore_from_trash(&self, id: Uuid) -> Result<PathBuf> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.restore_from_trash(id);
+        }
         let record = self.load_trash_record(id)?;
         let source = self.trashed_note_path(id, record.encrypted);
         let mut destination_relative = record.original_relative_path.clone();
@@ -726,6 +1067,10 @@ impl Vault {
     }
 
     pub fn permanently_delete(&self, id: Uuid) -> Result<()> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.permanently_delete(id);
+        }
         let record = self.load_trash_record(id)?;
         let note_path = self.trashed_note_path(id, record.encrypted);
         fs::remove_file(&note_path).map_err(|error| io_error(&note_path, error))?;
@@ -735,6 +1080,10 @@ impl Vault {
     }
 
     pub fn empty_trash(&self) -> Result<usize> {
+        self.ensure_writable()?;
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.empty_trash();
+        }
         let entries = self.scan_trash()?;
         let count = entries.len();
         for entry in entries {
@@ -744,12 +1093,18 @@ impl Vault {
     }
 
     pub fn note_path(&self, relative: &Path) -> Result<PathBuf> {
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.note_path(relative);
+        }
         let relative = ensure_relative_note_path(relative)?;
         reject_symlink_components(&self.notes_dir(), &relative)?;
         Ok(self.notes_dir().join(relative))
     }
 
     pub fn current_stamp(&self, relative: &Path) -> Result<FileStamp> {
+        if let Backend::Encrypted(store) = &self.backend {
+            return store.current_stamp(relative);
+        }
         let path = self.note_path(relative)?;
         file_stamp(&path)
     }
@@ -830,7 +1185,61 @@ impl Vault {
     }
 }
 
-fn check_password_policy(password: &str) -> Result<()> {
+/// Refuses `root` as the target of a *new* encrypted vault when it already
+/// holds a vault or plaintext note data. See [`Vault::check_encrypted_target`].
+///
+/// A non-existent folder, or an existing folder holding only unrelated files,
+/// is fine. Rejected: a `vault.toml` (a vault of either kind), a
+/// `.senatorial-notes/` directory (a partial/crashed vault), a `Notes/` /
+/// `Trash/` / `Attachments/` directory, or any `.md` / `.snote` file anywhere
+/// in the tree.
+fn ensure_encrypted_target_is_clean(root: &Path) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let reject = || Err(Error::EncryptedVaultTargetNotEmpty(root.to_path_buf()));
+
+    for marker in [VAULT_STATE_DIR, NOTES_DIR, TRASH_DIR, ATTACHMENTS_DIR] {
+        if root.join(marker).exists() {
+            return reject();
+        }
+    }
+    if contains_markdown_or_snote(root) {
+        return reject();
+    }
+    Ok(())
+}
+
+/// Whether any `.md` or `.snote` file exists anywhere under `dir` (symlinks are
+/// not followed). Used only to keep encrypted-vault creation off an existing
+/// plaintext vault.
+fn contains_markdown_or_snote(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            if contains_markdown_or_snote(&path) {
+                return true;
+            }
+        } else if matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("md" | "snote")
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn check_password_policy(password: &str) -> Result<()> {
     let length = password.chars().count();
     if length < crate::constants::MIN_PASSWORD_LENGTH {
         return Err(Error::WeakPassword(format!(
@@ -841,7 +1250,7 @@ fn check_password_policy(password: &str) -> Result<()> {
     Ok(())
 }
 
-fn normalized_title(title: &str) -> String {
+pub(crate) fn normalized_title(title: &str) -> String {
     let title = title.trim();
     if title.is_empty() {
         "Untitled".into()
@@ -860,7 +1269,7 @@ fn verify_stamp(path: &Path, expected: Option<&FileStamp>) -> Result<()> {
     Ok(())
 }
 
-fn file_stamp(path: &Path) -> Result<FileStamp> {
+pub(crate) fn file_stamp(path: &Path) -> Result<FileStamp> {
     let metadata = fs::metadata(path).map_err(|source| io_error(path, source))?;
     let modified = metadata
         .modified()
@@ -875,7 +1284,7 @@ fn file_stamp(path: &Path) -> Result<FileStamp> {
     })
 }
 
-fn create_private_directory(path: &Path) -> Result<()> {
+pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
     let existed = path.exists();
     fs::create_dir_all(path).map_err(|source| io_error(path, source))?;
     #[cfg(unix)]

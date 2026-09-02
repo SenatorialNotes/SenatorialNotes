@@ -54,6 +54,7 @@ mod tests {
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             encrypted: false,
             pinned: false,
+            favourite: false,
             archived: false,
             locked: false,
         }

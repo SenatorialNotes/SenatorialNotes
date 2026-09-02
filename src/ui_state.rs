@@ -21,9 +21,19 @@ pub enum ViewMode {
     #[default]
     AllNotes,
     Notebook(PathBuf),
+    /// Notes the user has recently *opened / viewed* (from
+    /// `VaultSessionState::recently_opened`), most-recent first. Deliberately
+    /// **not** modification time.
+    RecentlyOpened,
+    /// Notes the user marked as a favourite (a star). Independent of `Pinned`.
+    Favourites,
     Pinned,
-    RecentlyEdited,
     Archive,
+    /// Notes that carry their own per-note password (individually encrypted
+    /// `.snote` files). This is *not* "every note in a Secure Vault" - a
+    /// Secure Vault protects its notes as a whole; this view is only the notes
+    /// that additionally have a note password.
+    EncryptedNotes,
     Trash,
 }
 
@@ -46,9 +56,11 @@ impl ViewMode {
                 .and_then(|name| name.to_str())
                 .unwrap_or("Notebook")
                 .to_string(),
+            Self::RecentlyOpened => "Recently Opened".to_string(),
+            Self::Favourites => "Favourites".to_string(),
             Self::Pinned => "Pinned".to_string(),
-            Self::RecentlyEdited => "Recently Edited".to_string(),
             Self::Archive => "Archive".to_string(),
+            Self::EncryptedNotes => "Encrypted Notes".to_string(),
             Self::Trash => "Trash".to_string(),
         }
     }
@@ -233,9 +245,86 @@ impl FilterState {
     }
 }
 
+/// Tracks which vault "session" the UI is currently in.
+///
+/// Every vault open/switch [`bump`](SessionRegistry::bump)s the generation. A
+/// deferred callback (an autosave/title timer, the coalesced selection
+/// dispatch, a dialog response) records the generation it was armed under and,
+/// when it finally runs, calls [`is_current`](SessionRegistry::is_current): if
+/// the vault has been switched in the meantime the callback is stale and must
+/// do nothing, so it can never mutate the new vault with the old vault's
+/// intent. Kept here, outside `RefCell<AppState>`, for the same reason as
+/// [`SelectionCoordinator`] — a stale callback can check it without borrowing
+/// the application model.
+#[derive(Debug, Default)]
+pub struct SessionRegistry {
+    generation: Cell<u64>,
+}
+
+impl SessionRegistry {
+    /// The current session generation. Record this when arming a deferred
+    /// callback.
+    pub fn current(&self) -> u64 {
+        self.generation.get()
+    }
+
+    /// Advances to a new session generation (on a vault open/switch) and
+    /// returns it. Every callback armed under an earlier generation is now
+    /// stale.
+    pub fn bump(&self) -> u64 {
+        let next = self.generation.get().wrapping_add(1);
+        self.generation.set(next);
+        next
+    }
+
+    /// Whether `token` (from a prior [`current`](SessionRegistry::current)) is
+    /// still the live session.
+    pub fn is_current(&self, token: u64) -> bool {
+        self.generation.get() == token
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_generation_marks_earlier_callbacks_stale_after_a_switch() {
+        let sessions = SessionRegistry::default();
+        // Vault A opens.
+        let gen_a = sessions.bump();
+        assert!(sessions.is_current(gen_a));
+
+        // An autosave timer is armed under vault A.
+        let armed_under_a = sessions.current();
+
+        // The user switches to vault B before the timer fires.
+        let gen_b = sessions.bump();
+        assert_ne!(gen_a, gen_b);
+        assert!(sessions.is_current(gen_b));
+
+        // The stale timer finally fires: it must see itself as no longer current.
+        assert!(
+            !sessions.is_current(armed_under_a),
+            "a callback armed under vault A must be inert after switching to vault B"
+        );
+
+        // A fresh callback armed under B is current.
+        let armed_under_b = sessions.current();
+        assert!(sessions.is_current(armed_under_b));
+    }
+
+    #[test]
+    fn session_generation_survives_many_switches_and_wraps_safely() {
+        let sessions = SessionRegistry::default();
+        let mut last = sessions.current();
+        for _ in 0..10_000 {
+            let next = sessions.bump();
+            assert_ne!(next, last);
+            assert!(sessions.is_current(next));
+            last = next;
+        }
+    }
 
     #[test]
     fn programmatic_selection_is_suppressed_until_the_guard_drops() {
@@ -273,8 +362,14 @@ mod tests {
         assert_eq!(ViewMode::AllNotes.search_placeholder(), "Search notes");
         assert_eq!(ViewMode::Pinned.heading(), "Pinned");
         assert_eq!(ViewMode::Pinned.search_placeholder(), "Search Pinned");
-        assert_eq!(ViewMode::RecentlyEdited.heading(), "Recently Edited");
+        assert_eq!(ViewMode::RecentlyOpened.heading(), "Recently Opened");
+        assert_eq!(ViewMode::Favourites.heading(), "Favourites");
         assert_eq!(ViewMode::Archive.heading(), "Archive");
+        assert_eq!(ViewMode::EncryptedNotes.heading(), "Encrypted Notes");
+        assert_eq!(
+            ViewMode::EncryptedNotes.search_placeholder(),
+            "Search Encrypted Notes"
+        );
         assert_eq!(ViewMode::Trash.heading(), "Trash");
         assert_eq!(ViewMode::Trash.search_placeholder(), "Search Trash");
         // "All Notes" must never present another view's placeholder.

@@ -87,6 +87,7 @@ mod tests {
             tags: Vec::new(),
             encrypted: false,
             pinned,
+            favourite: false,
             archived: false,
             locked: false,
         }

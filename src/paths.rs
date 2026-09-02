@@ -1,6 +1,21 @@
 use std::path::{Component, Path, PathBuf};
 
+use directories::{BaseDirs, UserDirs};
+
 use crate::{Error, Result};
+
+/// The managed workspace root SenatorialNotes creates on first run, e.g.
+/// `~/Documents/SenatorialNotes/`. Uses the platform's Documents directory via
+/// the `directories` abstraction (XDG `XDG_DOCUMENTS_DIR` on Linux); falls back
+/// to `<home>/SenatorialNotes/` only when no Documents directory is known.
+pub fn default_workspace_root() -> Option<PathBuf> {
+    if let Some(documents) =
+        UserDirs::new().and_then(|dirs| dirs.document_dir().map(Path::to_path_buf))
+    {
+        return Some(documents.join("SenatorialNotes"));
+    }
+    BaseDirs::new().map(|base| base.home_dir().join("SenatorialNotes"))
+}
 
 pub fn sanitize_title(title: &str) -> String {
     let mut slug = String::with_capacity(title.len());

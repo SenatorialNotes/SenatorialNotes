@@ -19,9 +19,9 @@ use crate::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"SNOTE\0\0\0";
 const FORMAT_VERSION: u16 = 1;
-const SALT_LEN: usize = 16;
-const NONCE_LEN: usize = 24;
-const KEY_LEN: usize = 32;
+pub(crate) const SALT_LEN: usize = 16;
+pub(crate) const NONCE_LEN: usize = 24;
+pub(crate) const KEY_LEN: usize = 32;
 const HEADER_LEN: usize = 88;
 
 /// Production Argon2id parameters: 64 MiB memory, three passes, one lane.
@@ -236,7 +236,10 @@ pub fn inspect_header(container: &[u8]) -> Result<EncryptedHeader> {
     })
 }
 
-fn derive_key(
+/// Argon2id KDF. Shared with the whole-vault engine (`crypto::vault`) so both
+/// use identical parameters and the same conservative bounds check; the
+/// `.snote` container behaviour is unchanged.
+pub(crate) fn derive_key(
     password: &str,
     salt: &[u8; SALT_LEN],
     memory_kib: u32,
@@ -254,7 +257,7 @@ fn derive_key(
     Ok(key)
 }
 
-fn validate_kdf_parameters(memory_kib: u32, iterations: u32, lanes: u32) -> Result<()> {
+pub(crate) fn validate_kdf_parameters(memory_kib: u32, iterations: u32, lanes: u32) -> Result<()> {
     // Reject malicious containers that could request unreasonable work before
     // any allocation/derivation takes place.
     if !(8 * 1_024..=1_048_576).contains(&memory_kib)
