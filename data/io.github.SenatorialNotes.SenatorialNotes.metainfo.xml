@@ -15,12 +15,14 @@
       telemetry, analytics, advertising, or runtime networking.
     </p>
     <p>
-      It provides local vault creation, a Markdown editor with live visual
-      styling, atomic autosave, Trash and restore, nested notebooks, tags and
-      tag filtering, Archive, Pinned and Recently Edited views, user-controlled
-      sorting, a Note Information panel, appearance preferences, and optional
-      individually encrypted notes. More note-management features are planned
-      before 1.0.
+      It provides more than one vault with an in-app switcher, plain
+      (Standard) and whole-vault-encrypted (Secure) vaults, a Markdown editor
+      with live visual styling, atomic autosave, Trash and restore, nested
+      notebooks, tags and tag filtering, Archive, Favourites, Pinned and
+      Recently Opened views, user-controlled sorting, a Note Information panel,
+      appearance preferences, individually encrypted notes, and an explicit
+      export from a Secure Vault to a new plaintext Standard Vault. More
+      note-management features are planned before 1.0.
     </p>
     <p>
       The editor styles Markdown visually while keeping Markdown as the format
@@ -36,6 +38,19 @@
     <display_length compare="ge">768</display_length>
   </recommends>
   <releases>
+    <release version="0.3.0-alpha" date="2026-09-03">
+      <description>
+        <p>Vault architecture release.</p>
+        <ul>
+          <li>More than one vault, with an in-app vault switcher and an advisory vault lock.</li>
+          <li>Standard Vaults (plaintext Markdown) and Secure Vaults (whole-vault encryption with a Vault Password).</li>
+          <li>Lossless migration of older single-version vaults to the Standard vault manifest.</li>
+          <li>Per-note encrypted notes continue to work, including as an inner layer inside a Secure Vault.</li>
+          <li>Export a Secure Vault to a new, separate plaintext Standard Vault, off the UI thread and re-asking for the Vault Password.</li>
+          <li>Detection of plaintext written into a Secure Vault by an incompatible version, with an explicit-consent quarantine that never deletes or imports.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0-alpha" date="2026-09-01">
       <description>
         <p>Organisation and editor release.</p>

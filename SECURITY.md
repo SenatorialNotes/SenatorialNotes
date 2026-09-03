@@ -23,6 +23,8 @@ Ordinary `.md` vault files are plaintext. Individually encrypted `.snote` files 
 - deliberate copies, exports, backups, or synchronization performed outside the application;
 - physical access when the operating system and storage are not encrypted.
 
+A Secure Vault encrypts its whole contents at rest while locked, but the same limits apply while it is unlocked, and exporting it to a Standard Vault writes unencrypted plaintext to disk on purpose. A Standard Vault's ordinary `.md` notes are always plaintext.
+
 Use full-disk or encrypted home-directory storage for sensitive notes. Back up important vaults separately; local history is not a backup service.
 
 ## File handling
@@ -75,3 +77,30 @@ A vault can be created as a **Secure Vault** — an *encrypted vault*
 **Lock lifecycle.** An encrypted vault opens locked and shows an unlock screen; nothing is decrypted until the correct password is entered. Argon2id runs on a worker thread, never on the UI thread. A failed unlock changes nothing on disk and leaves the vault locked; repeated failures cannot corrupt it. "Lock Now", the idle timer, and losing window focus all drop the in-memory keys (zeroized on drop), clear the decrypted note list, search state, and editor buffer, and return to the lock screen. Search works only while the vault is unlocked and is never written to a persistent index. As with encrypted notes, locking is not a defence against a compromised running computer, and memory zeroization is best-effort against swap or a privileged memory scraper.
 
 A per-note `.snote` inside an encrypted vault is an additional inner layer with its own password; unlocking the vault does not unlock the note, and the outer layer always peels back to byte-identical `.snote` data.
+
+**Crash consistency.** A blob is written and fsynced before the manifest that references it is re-sealed. A crash in between leaves an orphan blob, which the next unlock moves to `store/orphans/` — never deletes — before building the model; a manifest entry whose blob is missing is surfaced as an unreadable note, and no note is silently dropped.
+
+## Secure → Standard export
+
+A Secure Vault can be exported to a **new, separate Standard Vault** containing plaintext Markdown copies of every note. This is an explicit, deliberate action, not a background feature:
+
+- It **writes unencrypted plaintext to disk**. The interface states this and asks for a deliberate confirmation, and the export only writes into a folder you choose that is empty.
+- It **re-asks for the Vault Password** even though the vault is already unlocked. The password is used only to re-derive the export worker's own key material on a worker thread and is not stored; the running unlocked session's keys are never handed to the worker.
+- It **does not modify the source Secure Vault** — every source byte (blobs, manifest, `vault.keys`, `vault.toml`) is unchanged afterwards.
+- It is **directory-transactional**: the new vault is built inside an application-owned temporary directory next to the destination and made the destination by a single atomic rename. A failure — including cancellation — leaves no partial vault at the destination; the temporary directory is removed, or its exact path is reported.
+- The exported Standard Vault gets its **own new `vault_id`**. Per-note `.snote` files are copied byte-identically and keep their own passwords. Trash is preserved. Recovery drafts, session state, and any encrypted index are not exported.
+- **Attachments fail closed.** If the Secure Vault's manifest carries any attachment record the export is refused before anything is written (`ExportUnsupportedContent`), because the Standard Vault has no attachment representation in this release and silently dropping attachments is not acceptable. No current build can create such a vault.
+
+In-place conversion of a vault between Standard and Secure — in either direction — is deliberately not implemented in this release.
+
+## Old or incompatible binaries and plaintext-conflict quarantine
+
+`v0.1` / `v0.2` SenatorialNotes binaries never read `vault.toml` and cannot recognise a Secure Vault. The forward guarantee is one-directional: a current binary refuses a `format_version` it does not understand, but an *older* binary opening a Secure Vault runs its "create the standard directories" loop and, if the user makes a note, writes a plaintext `.md` into a top-level `Notes/` folder. The encrypted store lives entirely under `.senatorial-notes/store/`, which an old binary never scans, so ciphertext and plaintext are never intermingled in one directory — but the stray plaintext must not be left where a later old-binary run could grow it.
+
+On opening a Secure Vault, a current binary **detects** such stray plaintext (a top-level `Notes/` or `Trash/` holding `.md`/`.snote`, an `Attachments/` folder holding any file, or a stray top-level `.md`/`.snote`) and opens the vault **read-only without moving anything**. The user chooses:
+
+- **Cancel** — nothing happens.
+- **Open Read-Only** — the vault opens read-only; the plaintext files are left exactly where they are.
+- **Quarantine Plaintext Files…** — the files are moved, **byte-for-byte unchanged**, by same-filesystem rename into `.senatorial-notes/quarantine/<timestamp>/`, and only then does the vault open normally.
+
+Nothing is ever deleted, merged, imported, parsed into encrypted storage, or silently relocated. If the move fails, every original file is preserved and the vault stays read-only or unopened, with the failure reported. Empty legacy directories on their own, and unrelated files such as `README.txt`, never trigger this.

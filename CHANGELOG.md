@@ -6,6 +6,170 @@ All notable changes to SenatorialNotes will be documented here. The format follo
 
 Nothing yet.
 
+## [0.3.0-alpha] - 2026-09-03
+
+This release introduces the vault architecture: more than one vault, an in-app
+vault switcher, an advisory vault lock, and whole-vault encryption ("Secure
+Vaults") alongside the existing per-note `.snote` encryption. It follows a
+real-machine acceptance pass on Arch Linux with Hyprland. It remains an alpha:
+the interface and the on-disk layout may still change before 1.0, though the
+vault manifest schema, the encrypted-vault container, the `.snote` container,
+and the HKDF label set are treated as format-stable from here.
+
+### Added
+
+- **Multiple vaults and an in-app vault switcher.** A header control lists the
+  current vault and recent vaults, opens a folder picker, and switches vaults
+  without restarting. Missing or moved recent-vault paths are shown as
+  unavailable rather than silently opened or dropped. Per-vault last state
+  (selected view, note, editor scroll) is restored where practical.
+- **Vault type architecture.** Every vault is a **Standard Vault**
+  (`vault.toml` `format_version = 2`, plaintext Markdown and `.snote` files,
+  exactly as before) or a **Secure Vault** (`format_version = 3`, whole-vault
+  encryption). The kind is recorded in `vault.toml` and never changes
+  implicitly.
+- **Lossless `vault.toml` migration.** An existing `format_version = 1` vault is
+  upgraded in place to `format_version = 2` (Standard) before any note or
+  directory is touched, preserving `vault_id` and `created_at`. A vault whose
+  manifest could not be written back opens read-only rather than partially
+  migrated. A `format_version` newer than this build understands is refused
+  without touching anything.
+- **Advisory vault lock.** Opening a vault for writing creates
+  `.senatorial-notes/vault.lock` (pid, hostname, boot id, app version, time — no
+  secrets) held for the session and released on clean exit. A vault already in
+  use offers Open Read-Only or Cancel; a stale lock is **never** removed
+  automatically — the lock's contents are shown and a takeover requires the
+  lock to be provably dead (a different boot, a gone process, or a positively
+  reused pid). A different host is always treated as possibly live.
+- **Secure Vaults (whole-vault encryption).** Create a new vault encrypted with
+  one **Vault Password**. Argon2id (64 MiB, three iterations, one lane) derives
+  a key-encryption key that unwraps a single random 32-byte vault master key;
+  HKDF-SHA256 derives per-domain subkeys; each object is sealed with
+  XChaCha20-Poly1305 and a fresh nonce. Note bodies, titles, tags, notebook
+  names and tree, trash, recovery drafts, and per-vault UI state are all stored
+  as opaque authenticated blobs with random names under
+  `.senatorial-notes/store/`. The only plaintext kept is what is needed to
+  identify and open the vault: `vault_id`, `format_version`, `kind`, and the
+  advisory-lock metadata. See
+  [`docs/ENCRYPTED_VAULT_FORMAT.md`](docs/ENCRYPTED_VAULT_FORMAT.md).
+- **Secure Vault lock lifecycle.** A Secure Vault opens locked and shows an
+  unlock screen; nothing is decrypted until the correct Vault Password is
+  entered. Argon2id runs on a worker thread, never on the UI thread. "Lock
+  Vault", an idle timer, and losing window focus all drop the in-memory keys
+  (zeroized on drop), clear the decrypted note list, search state, and editor,
+  and return to the lock screen. **Change Vault Password** re-wraps the vault
+  master key only — **no note blob is re-encrypted** — and the old password
+  stops working (verified after the write). Search works only while unlocked and
+  is never written to a persistent index.
+- **Per-note `.snote` encryption inside a Secure Vault.** Individually encrypted
+  notes remain separately supported. Inside a Secure Vault a `.snote` is an
+  **additional inner layer** with its own password: unlocking the vault does not
+  unlock the note, and peeling the outer layer always yields byte-identical
+  `.snote` container data.
+- **Secure → Standard export.** An explicit action builds a **new, separate
+  Standard Vault** containing unencrypted plaintext Markdown copies of every
+  live note, the full notebook tree (including empty notebooks), all metadata
+  (tags, favourite, pinned, archive), byte-identical inner `.snote` containers,
+  and Trash. The exported vault gets its own `vault_id`; the source Secure Vault
+  is not modified. The user re-enters the Vault Password (used only to derive
+  the export worker's key material, never stored); the decrypt-and-build work
+  runs on a worker thread with a progress display and a Cancel button. The
+  export is directory-transactional: it is built in an application-owned
+  temporary directory and made the destination by a single atomic rename, so a
+  failure leaves no partial vault at the destination and the source untouched.
+  **In v0.3 the export refuses a Secure Vault that contains attachment
+  records** (`ExportUnsupportedContent`), because the Standard Vault has no
+  attachment representation yet and silently dropping them is not acceptable; no
+  current build can create such a vault. Recovery drafts and session/transient
+  state are not exported. In-place conversion of a vault in either direction
+  remains deferred to a later release.
+- **R18 — plaintext-conflict detection with explicit-consent quarantine.** A
+  `v0.1` / `v0.2` binary that opens a Secure Vault cannot read `vault.toml` and
+  may write a plaintext note into a top-level `Notes/` folder. On opening a
+  Secure Vault, SenatorialNotes detects such stray plaintext (a `Notes/` or
+  `Trash/` folder holding `.md`/`.snote`, an `Attachments/` folder holding any
+  file, or a stray top-level `.md`/`.snote`) and opens the vault **read-only**
+  without moving anything. The user chooses Cancel, Open Read-Only (the files
+  are left exactly where they are), or **Quarantine Plaintext Files…**, which
+  moves them **unchanged** by same-filesystem rename into
+  `.senatorial-notes/quarantine/<timestamp>/`. Nothing is ever deleted, merged,
+  imported, or parsed into encrypted storage. If the move fails, every original
+  file is preserved and the vault stays read-only or unopened. Empty legacy
+  directories and unrelated files never trigger it.
+- **Note-header quick actions.** A lock/encrypt toggle, favourite, pin, and an
+  overflow menu (rename, move, archive, encryption, note information, delete) in
+  the editor's title row.
+- **Favourites** as an additive front-matter field independent of Pinned, with
+  a Favourites smart view, and a **Recently Opened** view (recorded when a note
+  is displayed, never on save — it never rewrites a note file). For a Secure
+  Vault this session state is sealed inside the encrypted manifest, not the
+  plaintext app config.
+- A focused **Secure Vault Settings** window (auto-lock timing and triggers,
+  Change Vault Password, Rename Vault, Export to Standard Vault). A Standard
+  Vault gets only the general settings.
+- **Rename Vault** changes only the name SenatorialNotes shows for a vault; it
+  never moves the folder, renames the directory, or re-encrypts anything.
+- New encrypted-vault, encrypted-lifecycle, corruption-matrix, quarantine,
+  export, vault-lock, vault-switching, and vault-manifest test suites. The
+  automated suite is now 318 tests across 21 binaries.
+
+### Changed
+
+- Product terminology is **"Standard Vault"** and **"Secure Vault"** in the
+  interface. "Encrypted Note" continues to mean a per-note `.snote` container.
+  On-disk names, enum values, and formats are unchanged.
+- `open_vault` validates the target and decides the advisory lock **before**
+  disturbing the current session; the outgoing vault is flushed and its lock
+  released only after a successful save.
+- The filesystem watcher is advisory-only for a Secure Vault: it cannot merge
+  hand-edited ciphertext, so it prompts for a reload rather than attempting a
+  content merge, and never writes a plaintext recovery file. It does not parse
+  the encrypted store.
+- The sidebar groups NOTES (All Notes / Recently Opened / Favourites / Pinned /
+  Archive) and SECURED VAULTS (a bounded list of recent Secure Vaults), with
+  Trash at the bottom.
+
+### Security
+
+- A Secure Vault's ciphertext binds `vault_id`, `object_uuid`, and
+  `object_type` as associated data but **not** the note's path, so moving or
+  renaming a note never re-encrypts it, while a blob from another vault, a
+  swapped blob, or a blob passed off as the wrong object type all fail
+  authentication. A wrong Vault Password, a tampered `vault.keys`, or a single
+  flipped byte in any blob fails safely: the vault or that note reads as
+  unavailable and unauthenticated plaintext is never returned. A crash between
+  writing a blob and re-sealing the manifest is reconciled on the next unlock —
+  an orphan blob is moved to `store/orphans/`, never deleted, and no note is
+  lost.
+- **Secure → Standard export produces unencrypted plaintext on disk** and
+  therefore requires the Vault Password to be re-entered even though the vault
+  is already unlocked, shows an explicit plaintext-on-disk warning, and writes
+  only to a new empty folder. The source Secure Vault is byte-for-byte
+  unchanged.
+- What remains visible on disk for a locked Secure Vault: the number of blob
+  files and each blob's size and modification time, the total vault size, the
+  `created_at` and `vault_id` in `vault.toml`, and that the folder is a locked
+  SenatorialNotes vault. Blob-size padding is future work.
+- Memory zeroization for vault keys and decrypted buffers is best-effort
+  (`Zeroizing`); it does not defeat swap, hibernation, or a privileged memory
+  scraper, and the format makes no such promise. Locking is not a defence
+  against a compromised running computer.
+- Old `v0.1` / `v0.2` binaries provide no forward-compatibility guarantee and
+  cannot safely open a Secure Vault; the structural containment (the encrypted
+  store lives entirely under `.senatorial-notes/`) plus R18 detection keep an
+  old binary's plaintext writes separate from ciphertext rather than
+  intermingled.
+
+### Deviations from the design documents
+
+- The encrypted vault uses a single sealed manifest (`store/manifest`) rather
+  than per-directory manifests; `created_at` stays in the plaintext `vault.toml`
+  for both vault kinds; the storage abstraction is a backend enum on `Vault`,
+  not a trait; the off-main-thread key derivation uses `gio::spawn_blocking`.
+  The `SNENC` object header is 80 bytes; the `SNVLT` keyfile header is 88 bytes.
+- The `k_metadata` and `k_index` HKDF subkeys are derived but currently unused
+  (reserved for a per-vault metadata blob and an encrypted local index).
+
 ## [0.2.0-alpha] - 2026-09-01
 
 This release focuses on note organisation and the editor. It follows a real-machine
@@ -212,6 +376,7 @@ Markdown markers remain visible but subdued.
 - Storage/path-safety tests and forbidden HTTP-client dependency check.
 - Desktop, AppStream, icon, Arch, Flatpak, security, and contribution metadata.
 
-[Unreleased]: https://github.com/SenatorialNotes/SenatorialNotes/compare/v0.2.0-alpha...HEAD
+[Unreleased]: https://github.com/SenatorialNotes/SenatorialNotes/compare/v0.3.0-alpha...HEAD
+[0.3.0-alpha]: https://github.com/SenatorialNotes/SenatorialNotes/compare/v0.2.0-alpha...v0.3.0-alpha
 [0.2.0-alpha]: https://github.com/SenatorialNotes/SenatorialNotes/compare/v0.1.0-alpha...v0.2.0-alpha
 [0.1.0]: https://github.com/SenatorialNotes/SenatorialNotes/releases/tag/v0.1.0-alpha

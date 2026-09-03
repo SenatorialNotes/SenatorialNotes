@@ -1,9 +1,9 @@
 # Maintainer: SenatorialNotes contributors
 pkgname=senatorial-notes
-# Upstream tag is v0.2.0-alpha; pkgver replaces the '-' Arch disallows with '_'.
-_tag=v0.2.0-alpha
-_srcver=0.2.0-alpha
-pkgver=0.2.0_alpha
+# Upstream tag is v0.3.0-alpha; pkgver replaces the '-' Arch disallows with '_'.
+_tag=v0.3.0-alpha
+_srcver=0.3.0-alpha
+pkgver=0.3.0_alpha
 pkgrel=1
 pkgdesc='Private, local-only Markdown notes application'
 arch=('x86_64')
