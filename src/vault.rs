@@ -19,6 +19,7 @@ use crate::paths::{
 use crate::storage::atomic::{atomic_write, rename_no_replace};
 use crate::vault_encrypted::{self, EncryptedStore};
 use crate::vault_manifest::{self, Migration, VaultKind, VaultManifest};
+use crate::vault_quarantine::{self, PendingQuarantine, QuarantineReport};
 use crate::{Error, Result};
 
 const NOTES_DIR: &str = "Notes";
@@ -47,6 +48,13 @@ pub struct Vault {
     /// tree can never drift apart. Stage B's vault lock will reuse this flag for
     /// "Open read-only".
     read_only: bool,
+    /// R18: plaintext storage artifacts an old / incompatible binary wrote into
+    /// this Secure Vault's root, detected on open and **not** yet moved. While
+    /// this is `Some`, `read_only` is forced `true` (no mutating operation may
+    /// run) and the UI must resolve the conflict — the user explicitly choosing
+    /// [`Vault::quarantine_plaintext`] or "open read-only" — before a normal
+    /// writable session is allowed. Always `None` for a Standard Vault.
+    pending_quarantine: Option<PendingQuarantine>,
     backend: Backend,
 }
 
@@ -125,12 +133,18 @@ impl Vault {
                 if outcome.manifest.format_version != vault_manifest::ENCRYPTED_MANIFEST_VERSION {
                     return Err(Error::UnsupportedVaultKind);
                 }
+                // R18: look for plaintext an old binary may have written into
+                // the vault root. Detection only — nothing is moved here. If
+                // anything is found the vault opens forced-read-only and the UI
+                // must resolve the conflict before a writable session.
+                let pending_quarantine = vault_quarantine::detect(root);
                 let store = EncryptedStore::open(&state_dir, outcome.manifest.vault_id)?;
                 return Ok(Self {
                     root: root.to_path_buf(),
                     manifest: outcome.manifest,
                     migration: outcome.migration,
-                    read_only: false,
+                    read_only: pending_quarantine.is_some(),
+                    pending_quarantine,
                     backend: Backend::Encrypted(store),
                 });
             }
@@ -144,6 +158,7 @@ impl Vault {
                 manifest: outcome.manifest,
                 migration: outcome.migration,
                 read_only,
+                pending_quarantine: None,
                 backend: Backend::Plain,
             };
             // Never create or repair the directory tree for a read-only vault -
@@ -160,6 +175,7 @@ impl Vault {
                 manifest: VaultManifest::new_ordinary(),
                 migration: Migration::NotNeeded,
                 read_only: false,
+                pending_quarantine: None,
                 backend: Backend::Plain,
             };
             vault.ensure_directories()?;
@@ -223,6 +239,7 @@ impl Vault {
             manifest,
             migration: Migration::NotNeeded,
             read_only: false,
+            pending_quarantine: None,
             backend: Backend::Encrypted(store),
         })
     }
@@ -386,11 +403,35 @@ impl Vault {
         &self.migration
     }
 
-    /// Whether this vault is open read-only. Currently `true` only when a
-    /// manifest migration could not be persisted; every mutating method returns
-    /// [`Error::VaultReadOnly`] while this holds.
+    /// Whether this vault is open read-only. `true` when a manifest migration
+    /// could not be persisted, or (for a Secure Vault) while an unresolved R18
+    /// plaintext conflict stands ([`Vault::pending_quarantine`]). Every mutating
+    /// method returns [`Error::VaultReadOnly`] while this holds.
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// R18: plaintext storage artifacts an old / incompatible binary left in
+    /// this Secure Vault's root, detected on open and not yet moved. `Some`
+    /// means the vault is forced read-only until the user resolves the conflict
+    /// (an explicit [`Vault::quarantine_plaintext`], or a deliberate read-only
+    /// open). `None` for a clean vault or any Standard Vault.
+    pub fn pending_quarantine(&self) -> Option<&PendingQuarantine> {
+        self.pending_quarantine.as_ref()
+    }
+
+    /// Moves the detected R18 plaintext artifacts, unchanged, into
+    /// `.senatorial-notes/quarantine/<timestamp>/` (same-filesystem rename;
+    /// never deleted, parsed, merged, or overwritten). Only a UI caller acting
+    /// on an explicit user choice calls this. On success the caller must
+    /// re-open the vault to get a clean, writable session.
+    pub fn quarantine_plaintext(&self) -> Result<QuarantineReport> {
+        match &self.pending_quarantine {
+            Some(pending) => pending.quarantine(),
+            None => Err(Error::Quarantine(
+                "there is nothing to quarantine in this vault".into(),
+            )),
+        }
     }
 
     /// Guard at the top of every mutating operation.
@@ -1237,6 +1278,32 @@ fn contains_markdown_or_snote(dir: &Path) -> bool {
         }
     }
     false
+}
+
+/// Writes a Standard-Vault trash record (`<trash_dir>/<note_id>.trash.toml`)
+/// for a note copied out of a Secure Vault by the Secure \u{2192} Standard
+/// export. The matching note file is written separately by the caller. This
+/// only ever touches the export's own fresh destination tree.
+pub(crate) fn write_exported_trash_record(
+    trash_dir: &Path,
+    note_id: Uuid,
+    original_relative_path: &Path,
+    trashed_at: chrono::DateTime<Utc>,
+    encrypted: bool,
+) -> Result<()> {
+    let record = TrashRecord {
+        format_version: 1,
+        note_id,
+        original_relative_path: original_relative_path.to_path_buf(),
+        trashed_at,
+        encrypted,
+    };
+    let text =
+        toml::to_string_pretty(&record).map_err(|error| Error::Configuration(error.to_string()))?;
+    atomic_write(
+        &trash_dir.join(format!("{note_id}.trash.toml")),
+        text.as_bytes(),
+    )
 }
 
 pub(crate) fn check_password_policy(password: &str) -> Result<()> {

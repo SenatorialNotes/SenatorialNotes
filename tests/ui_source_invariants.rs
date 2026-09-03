@@ -235,16 +235,20 @@ fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
     &source[start..end]
 }
 
-/// `open_vault` plus `proceed_with_opened_vault`, as a single slice. A Stage D
-/// refactor moved the advisory-lock decision out of `open_vault` into the
-/// shared `proceed_with_opened_vault` helper (also reached by the encrypted-
-/// vault creator); the Stage B/C lock invariants inspect the flow as a whole.
-/// `open_vault`'s body still comes first, so relative-order assertions hold.
+/// `open_vault` plus `proceed_with_opened_vault` plus `finish_opening_vault`,
+/// as a single slice. A Stage D refactor moved the advisory-lock decision out
+/// of `open_vault` into the shared `proceed_with_opened_vault` helper (also
+/// reached by the encrypted-vault creator); a Stage E refactor then split the
+/// lock decision itself into `finish_opening_vault` so an R18 plaintext
+/// conflict can be resolved first. The Stage B/C lock invariants inspect the
+/// flow as a whole. `open_vault`'s body still comes first, so relative-order
+/// assertions hold.
 fn open_vault_flow(source: &str) -> String {
     format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         function_body(source, "open_vault"),
         function_body(source, "proceed_with_opened_vault"),
+        function_body(source, "finish_opening_vault"),
     )
 }
 
@@ -1529,4 +1533,160 @@ fn recently_opened_is_recorded_when_a_note_is_displayed_not_when_it_is_saved() {
         .expect("a RecentlyOpened arm");
     assert!(recently_arm.contains("recently_opened.contains(&summary.id)"));
     assert!(recently_arm.contains("!summary.locked"));
+}
+
+// ---------------------------------------------------------------------------
+// Stage E — R18 plaintext quarantine + Secure→Standard export
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r18_detection_never_moves_anything_on_open() {
+    let vault = include_str!("../src/vault.rs");
+    // The encrypted-vault open path only *detects* — nothing is moved there.
+    let detect_at = vault
+        .find("let pending_quarantine = vault_quarantine::detect(root);")
+        .expect("an encrypted vault open must run detection");
+    let return_at = vault[detect_at..]
+        .find("backend: Backend::Encrypted(store),")
+        .map(|o| detect_at + o)
+        .expect("the encrypted branch returns a Backend::Encrypted vault");
+    let open_branch = &vault[detect_at..return_at];
+    assert!(
+        !open_branch.contains(".quarantine()"),
+        "open must never move plaintext; that is a separate, user-driven step"
+    );
+    assert!(open_branch.contains("read_only: pending_quarantine.is_some()"));
+
+    // The only caller of the actual move is the explicit method.
+    let move_calls = vault.matches("pending.quarantine()").count();
+    assert_eq!(move_calls, 1, "exactly one place performs the move");
+    assert!(vault.contains("pub fn quarantine_plaintext(&self)"));
+}
+
+#[test]
+fn r18_quarantine_only_renames_and_never_destroys() {
+    let quarantine = include_str!("../src/vault_quarantine.rs");
+    for forbidden in [
+        "remove_file",
+        "remove_dir_all",
+        "remove_dir(",
+        "fs::write",
+        "truncate",
+    ] {
+        assert!(
+            !quarantine.contains(forbidden),
+            "the quarantine module must never destroy or rewrite a file: {forbidden}"
+        );
+    }
+    assert!(
+        quarantine.contains("fs::rename("),
+        "quarantine moves artifacts by same-filesystem rename"
+    );
+    // Never walks into the encrypted state directory.
+    assert!(quarantine.contains("VAULT_STATE_DIR"));
+}
+
+#[test]
+fn r18_conflict_dialog_offers_read_only_and_explicit_quarantine_only() {
+    let source = include_str!("../src/ui.rs");
+    let dialog = function_body(source, "present_plaintext_conflict_dialog");
+    // Exactly these three choices, in this order.
+    let buttons_at = dialog.find(".buttons(vec![").expect("dialog buttons");
+    let buttons = &dialog[buttons_at..buttons_at + 120];
+    assert!(buttons.contains("\"Cancel\""));
+    assert!(buttons.contains("\"Open Read-Only\""));
+    assert!(buttons.contains("Quarantine Plaintext Files"));
+    for forbidden in ["Delete", "Merge", "Import", "Combine"] {
+        assert!(
+            !buttons.contains(forbidden),
+            "the R18 dialog must not offer a {forbidden} button"
+        );
+    }
+    // The proceed path only continues after an explicit choice.
+    assert!(dialog.contains("vault.quarantine_plaintext()"));
+    assert!(dialog.contains("finish_opening_vault"));
+}
+
+#[test]
+fn export_runs_on_a_worker_thread_and_re_authenticates() {
+    let source = include_str!("../src/ui.rs");
+    let worker = function_body(source, "run_export_worker");
+    assert!(
+        worker.contains("gio::spawn_blocking"),
+        "the export must not run on the GTK main thread"
+    );
+    assert!(
+        worker.contains("export_secure_vault_to_standard"),
+        "the worker calls the export engine"
+    );
+    assert!(worker.contains("glib::spawn_future_local"));
+    assert!(
+        worker.contains("widgets.sessions.is_current(session)"),
+        "the UI continuation is session-generation guarded"
+    );
+    // The user re-enters the Vault Password before a plaintext export.
+    let step = function_body(source, "export_step_password");
+    assert!(step.contains("present_password_dialog"));
+    assert!(step.contains("Confirm Vault Password"));
+}
+
+#[test]
+fn export_engine_only_reads_the_source_and_is_directory_transactional() {
+    let export = include_str!("../src/vault_export.rs");
+    // The source is only ever read.
+    for forbidden in [
+        "source.save_note",
+        "source_vault.save",
+        "atomic_write(&params.source",
+        "fs::write(&params.source",
+        "fs::rename(&params.source",
+    ] {
+        assert!(
+            !export.contains(forbidden),
+            "export must not write to the source: {forbidden}"
+        );
+    }
+    // Built in an app-owned temp dir, then moved onto the destination by a
+    // SINGLE atomic rename — never a recursive copy that could make the
+    // destination gradually appear as a "successful-looking" partial vault.
+    assert!(export.contains(".senatorial-export-"));
+    let finalize_at = export
+        .find("fn finalize_move(")
+        .expect("finalize_move exists");
+    let finalize = &export[finalize_at..(finalize_at + 700).min(export.len())];
+    assert!(finalize.contains("fs::rename(temp, destination)"));
+    for forbidden in ["copy_tree", "fs::copy("] {
+        assert!(
+            !finalize.contains(forbidden),
+            "finalize_move must not fall back to a copy: {forbidden}"
+        );
+    }
+    assert!(
+        !export.contains("fn copy_tree"),
+        "the recursive copy fallback must be gone entirely"
+    );
+    // On failure the destination is removed and the temp cleaned up.
+    assert!(export.contains("fs::remove_dir_all(&destination)"));
+    assert!(export.contains("ExportCleanupFailed"));
+    // Attachments fail closed before any destination exists.
+    let engine = function_body(export, "export_secure_vault_to_standard");
+    let guard_at = engine
+        .find("ExportUnsupportedContent")
+        .expect("attachment guard");
+    let temp_at = engine.find("make_temp_dir").expect("temp creation");
+    assert!(
+        guard_at < temp_at,
+        "the attachment guard runs before any destination is created"
+    );
+}
+
+#[test]
+fn export_action_is_gated_to_an_unlocked_writable_secure_vault() {
+    let source = include_str!("../src/ui.rs");
+    let switcher = function_body(source, "render_vault_switcher");
+    assert!(
+        switcher.contains("\"export-standard-vault\","),
+        "the export action must be gated in render_vault_switcher"
+    );
+    assert!(switcher.contains("secure_vault_unlocked && !session_read_only"));
 }

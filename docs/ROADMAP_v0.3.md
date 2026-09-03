@@ -491,8 +491,50 @@ Stage A is the manifest + migration work, not the multi-vault UI.
   Lock Now / auto-lock, `.snote`-inside semantics, encrypted-store watcher,
   search only while unlocked. Adds `hkdf` + `sha2`. `tests/encrypted_vault.rs`
   + `crypto::vault` + `vault_encrypted` unit tests.
-- **Stage E — real-machine acceptance.** Arch/Hyprland acceptance pass for the
-  encrypted-vault flows (extended `STABILITY_TEST_PLAN.md`).
+- **Stage E — R18 quarantine, Secure \u{2192} Standard export, encrypted
+  lifecycle hardening, then real-machine acceptance.** *(engine + tests done;
+  Arch/Hyprland acceptance pending)*
+  - `src/vault_quarantine.rs` — **detect-first, never auto-move**. Opening a v3
+    Secure Vault whose root holds plaintext an old / incompatible binary wrote
+    (`Notes/` or `Trash/` with `.md`/`.snote`, `Attachments/` with any file, a
+    stray top-level `.md`/`.snote`) opens the vault **forced read-only** and
+    surfaces a dialog: **Cancel / Open Read-Only / Quarantine Plaintext
+    Files\u{2026}**. Only the explicit choice moves anything, by same-filesystem
+    rename into `.senatorial-notes/quarantine/<timestamp>/`; nothing is ever
+    deleted, merged, parsed, or overwritten, and `.senatorial-notes/` is never
+    inspected. A failed move leaves the vault unopened / read-only with every
+    original file preserved. Empty legacy directories and unrelated files
+    (`README.txt`) never trigger.
+  - `src/vault_export.rs` — **Secure \u{2192} Standard safe export**. A new,
+    separate Standard Vault (its own `vault_id`) with plaintext copies of every
+    live note, the full notebook tree (empty notebooks included), all metadata
+    (tags / favourite / pinned / archive), byte-identical inner `.snote`
+    containers, and **Trash**. Runs on a worker thread (`gio::spawn_blocking`);
+    the user re-enters the Vault Password, which is used only to derive the
+    worker's key material. **Attachments fail closed** — if the manifest carries
+    any attachment record the export is refused before any destination is
+    created (the Standard Vault has no attachment representation yet; see below).
+    Directory-transactional: built in an app-owned
+    `<dest-parent>/.senatorial-export-<rand>.tmp/`, validated, then made the
+    destination by a **single atomic rename** (same filesystem by construction;
+    **no recursive-copy fallback** — an unexpected cross-filesystem rename is an
+    export failure). Before finalization the destination does not exist; after
+    it, it appears atomically as the complete validated vault. On any failure
+    the destination never appears, the source is untouched, and the staging
+    directory is removed (or its exact path is reported). Recovery / session /
+    transient state is not exported (documented). The source Secure Vault is
+    proven byte-for-byte unchanged.
+  - `tests/vault_quarantine.rs` (7), `tests/vault_export.rs` (9) +
+    `vault_export` unit tests (3, incl. a finalization-failure test that no
+    partial destination appears), `tests/encrypted_lifecycle.rs` (6: many
+    lock/unlock cycles interleaved with every mutation; crash between blob and
+    manifest loses nothing and quarantines the orphan; password change under
+    load re-encrypts no blob; scale; full nested-`.snote` lifecycle; R18 +
+    export interaction), corruption matrix + password-change hardening added to
+    `tests/encrypted_vault.rs` (30), six Stage-E source guards in
+    `tests/ui_source_invariants.rs` (68).
+  - **Then**: Arch/Hyprland acceptance pass for the encrypted-vault flows
+    (extended `STABILITY_TEST_PLAN.md`).
 - **Stage F — Docs, packaging, release prep.** README / SECURITY / CHANGELOG,
   `metainfo.xml` release, `0.3.0-alpha` version bump. Not tagged, not pushed —
   the user's real-machine call, as with v0.2.
@@ -523,13 +565,27 @@ together). Deliberate refinements to the design draft, all documented in
   (glib 0.22 removed `MainContext::channel`). `VaultKeys` is `Send`.
 - **`SNENC` header is 80 bytes** (final field packing); the keyfile header is
   88 bytes as specified.
-- **The old-binary plaintext-`Notes/` quarantine (R18) is not yet implemented** —
-  the structural containment (encrypted store entirely under
-  `.senatorial-notes/store/`) holds, but a current binary does not yet detect
-  and surface a stray top-level `Notes/`. Tracked for a later stage.
-- **In-place decrypt/export to an ordinary vault is not implemented** in this
-  stage (was listed as a Stage-D deliverable); deferred with the conversion
-  work.
+- ~~**The old-binary plaintext-`Notes/` quarantine (R18) is not yet
+  implemented**~~ — **done in Stage E** (`src/vault_quarantine.rs`,
+  detect-first + explicit user consent).
+- ~~**In-place decrypt/export to an ordinary vault is not implemented**~~ —
+  **Secure \u{2192} Standard *export* done in Stage E** (`src/vault_export.rs`,
+  a new separate Standard Vault, not in-place). In-place *conversion* of an
+  existing vault (either direction) remains deferred to v0.4.
+
+### Stage E export limitation — attachments
+
+The ordinary (Standard) vault has **no representation for attachments** — no
+on-disk layout, no index, no read/write API. Attachments exist only on the
+encrypted side (`k_attachments`, `AttachmentRecord`), and no shipped or current
+build can put an attachment record into a real Secure Vault (there is no UI and
+no reachable non-test call site). Rather than invent a Standard-Vault attachment
+format as a side effect of the export, or silently drop attachments, the export
+**fails closed**: if `manifest.attachments` is non-empty it returns
+`Error::ExportUnsupportedContent` before creating any destination. When real
+attachment support is designed later, Standard-Vault attachment storage should
+be built for both normal use **and** Secure \u{2192} Standard export at the same
+time.
 
 ## 8. Resolved decisions (2026-09-02)
 

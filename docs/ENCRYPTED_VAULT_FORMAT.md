@@ -207,8 +207,31 @@ The forward fence for every binary from Stage A onward is the
 up to v2 refuses a v3 vault outright, and this build (understanding v3) refuses
 v4+.
 
-An in-place "decrypt vault → plaintext Markdown" escape hatch is planned for a
-later stage so the at-rest form is never a one-way door; it is not in v0.3.
+**Detection + explicit quarantine (Stage E, `src/vault_quarantine.rs`).** A
+current binary opening a v3 Secure Vault scans the *root* (never
+`.senatorial-notes/`) for ordinary-storage artifacts an old binary could have
+written: a top-level `Notes/` or `Trash/` containing `.md`/`.snote`, an
+`Attachments/` directory containing any file, or a stray top-level
+`.md`/`.snote`. If any are found the vault opens **forced read-only** and the
+user is offered exactly: *Cancel*, *Open Read-Only* (artifacts untouched), or
+*Quarantine Plaintext Files…*. Only that last, explicit choice moves anything —
+by same-filesystem rename into `.senatorial-notes/quarantine/<timestamp>/`.
+Nothing is ever deleted, merged, parsed as encrypted storage, or overwritten;
+empty legacy directories and unrelated files (`README.txt`) never trigger it. A
+failed move leaves every original file in place and the vault unopened /
+read-only.
+
+**Secure → Standard export (Stage E, `src/vault_export.rs`).** An explicit
+"export to a new Standard Vault" operation writes plaintext Markdown copies of
+every live note, the notebook tree, all metadata, and Trash into a *separate*
+ordinary vault with its own `vault_id`. Per-note `.snote` files come out
+byte-identical (only the outer vault layer is peeled) and still open with their
+own password. It runs on a worker thread from a re-entered Vault Password, is
+directory-transactional (built in a staging directory inside the destination's
+own parent, then made the destination by a single atomic rename — no
+recursive-copy fallback, so the destination never partially appears), and never
+modifies the source. In-place *conversion* of an existing vault is still
+deferred to v0.4.
 
 ## 5. The keyfile — `.senatorial-notes/vault.keys`
 
@@ -460,7 +483,14 @@ against — now follows `Vault::watch_paths()`, which for an encrypted vault is
   note/attachment it holds. Deferred past v0.3.
 - **`created_at` is plaintext** in `vault.toml` for both vault kinds (§1, §4).
 - **No in-place conversion** of an existing ordinary vault to an encrypted one —
-  deferred to a later release. v0.3 creates encrypted vaults from scratch.
+  deferred to a later release. v0.3 creates encrypted vaults from scratch, and
+  (Stage E) *exports* a Secure Vault to a new, separate Standard Vault.
+- **Secure → Standard export refuses a vault with attachment records.** The
+  Standard vault has no attachment representation yet; rather than drop them or
+  invent a format mid-export, the export fails closed
+  (`Error::ExportUnsupportedContent`) before writing anything. No current build
+  can produce such a vault. Recovery / session / transient state is also not
+  exported (by design).
 - **`k_metadata` / `k_index` are derived but unused** — reserved for a per-vault
   metadata blob and an encrypted local search index.
 - An unlocked vault is exactly as exposed as an open `.snote` (§1). Memory

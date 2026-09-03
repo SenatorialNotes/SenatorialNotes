@@ -40,33 +40,33 @@ use crate::vault::{
 use crate::{Error, Result};
 
 pub(crate) const KEYFILE_NAME: &str = "vault.keys";
-const STORE_DIR: &str = "store";
-const MANIFEST_NAME: &str = "manifest";
+pub(crate) const STORE_DIR: &str = "store";
+pub(crate) const MANIFEST_NAME: &str = "manifest";
 const ORPHAN_DIR: &str = "orphans";
 const MANIFEST_SCHEMA: u32 = 1;
 
 /// The manifest object's UUID is a fixed constant (its `object_type` +
 /// `k_names` subkey already isolate it from every note blob).
-const MANIFEST_OBJECT_UUID: Uuid = Uuid::from_bytes([
+pub(crate) const MANIFEST_OBJECT_UUID: Uuid = Uuid::from_bytes([
     0x5e, 0x11, 0xa7, 0x00, 0x1a, 0x9e, 0x57, 0x00, 0x9b, 0xd0, 0xd4, 0xad, 0xe3, 0x90, 0x46, 0x01,
 ]);
 
 // --- manifest -------------------------------------------------------------
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Manifest {
+pub(crate) struct Manifest {
     schema: u32,
     created_at: DateTime<Utc>,
     /// Notebook relative paths (under a virtual `Notes/`), always including
     /// `Inbox`. Order is not significant.
-    notebooks: Vec<String>,
-    notes: Vec<NoteRecord>,
+    pub(crate) notebooks: Vec<String>,
+    pub(crate) notes: Vec<NoteRecord>,
     #[serde(default)]
-    trash: Vec<TrashRecord>,
+    pub(crate) trash: Vec<TrashRecord>,
     #[serde(default)]
     recovery: Vec<RecoveryRecord>,
     #[serde(default)]
-    attachments: Vec<AttachmentRecord>,
+    pub(crate) attachments: Vec<AttachmentRecord>,
     /// Per-vault UI/session state (last note, last view, recently-opened
     /// notes, editor scroll). For a Secure Vault this lives here - sealed -
     /// never in the plaintext app config. Additive; the `schema` number is
@@ -104,28 +104,28 @@ impl Manifest {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct NoteRecord {
-    object_id: String,
-    object_uuid: Uuid,
-    notebook: String,
-    filename: String,
-    snote: bool,
+pub(crate) struct NoteRecord {
+    pub(crate) object_id: String,
+    pub(crate) object_uuid: Uuid,
+    pub(crate) notebook: String,
+    pub(crate) filename: String,
+    pub(crate) snote: bool,
 }
 
 impl NoteRecord {
-    fn relative_path(&self) -> PathBuf {
+    pub(crate) fn relative_path(&self) -> PathBuf {
         Path::new(&self.notebook).join(&self.filename)
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct TrashRecord {
-    object_id: String,
-    object_uuid: Uuid,
-    note_id: Uuid,
-    original_relative_path: String,
-    trashed_at: DateTime<Utc>,
-    snote: bool,
+pub(crate) struct TrashRecord {
+    pub(crate) object_id: String,
+    pub(crate) object_uuid: Uuid,
+    pub(crate) note_id: Uuid,
+    pub(crate) original_relative_path: String,
+    pub(crate) trashed_at: DateTime<Utc>,
+    pub(crate) snote: bool,
     title: String,
 }
 
@@ -137,7 +137,7 @@ struct RecoveryRecord {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct AttachmentRecord {
+pub(crate) struct AttachmentRecord {
     object_id: String,
     object_uuid: Uuid,
     note_id: Uuid,
@@ -1174,6 +1174,31 @@ pub(crate) fn rewrap_vault_keyfile(
         ));
     }
     Ok(())
+}
+
+/// Reads and decrypts the sealed manifest at `<state_dir>/store/manifest` with
+/// already-derived `keys`, without opening an [`EncryptedStore`] session. Used
+/// by the worker-thread Secure \u{2192} Standard export, which owns its own
+/// key material and never touches the live (non-`Send`) store.
+pub(crate) fn read_sealed_manifest(state_dir: &Path, keys: &VaultKeys) -> Result<Manifest> {
+    let path = state_dir.join(STORE_DIR).join(MANIFEST_NAME);
+    let blob = fs::read(&path).map_err(|source| io_error(&path, source))?;
+    let (plaintext, _) = keys.open(ObjectType::Manifest, MANIFEST_OBJECT_UUID, &blob)?;
+    let manifest: Manifest = serde_json::from_slice(&plaintext)
+        .map_err(|error| Error::InvalidEncryptedVault(format!("manifest: {error}")))?;
+    if manifest.schema != MANIFEST_SCHEMA {
+        return Err(Error::InvalidEncryptedVault(format!(
+            "unsupported manifest schema {}",
+            manifest.schema
+        )));
+    }
+    Ok(manifest)
+}
+
+/// The absolute path of a store blob, for a caller (the export worker) that
+/// holds a `state_dir` but no [`EncryptedStore`].
+pub(crate) fn store_blob_path(state_dir: &Path, object_id: &str) -> PathBuf {
+    state_dir.join(STORE_DIR).join(object_id)
 }
 
 fn verify_blob_stamp(path: &Path, expected: Option<&FileStamp>) -> Result<()> {

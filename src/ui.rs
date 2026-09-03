@@ -23,9 +23,13 @@ use senatorial_notes::ui_state::{
     FilterState, RowTarget, SelectionCoordinator, SelectionIntent, SessionRegistry, UiFlow,
     ViewMode,
 };
+use senatorial_notes::vault_export::{
+    ExportParams, ExportProgress, ExportReport, export_secure_vault_to_standard,
+};
 use senatorial_notes::vault_lock::{
     BlockedReason, DeadReason, LockAcquisition, LockStatus, VaultLock,
 };
+use senatorial_notes::vault_quarantine::{ArtifactCategory, QuarantineReport};
 use senatorial_notes::watcher::VaultWatcher;
 use senatorial_notes::{
     EncryptedSession, FileStamp, Note, NoteMetadata, NoteSummary, NotebookEntry, TrashEntry, Vault,
@@ -1784,6 +1788,10 @@ fn application_menu() -> gio::Menu {
         Some("Change Vault Password…"),
         Some("app.change-vault-password"),
     );
+    vault_security.append(
+        Some("Export to Standard Vault…"),
+        Some("app.export-standard-vault"),
+    );
     menu.append_section(Some("Secure Vault"), &vault_security);
 
     menu.append(Some("Preferences"), Some("app.preferences"));
@@ -2084,6 +2092,25 @@ fn open_vault(
 /// switch (or shows the lock-contention dialog). Shared by opening an existing
 /// vault and creating a new (ordinary or encrypted) one.
 fn proceed_with_opened_vault(
+    vault: Vault,
+    path: PathBuf,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    // R18: a Secure Vault whose root holds plaintext an old / incompatible
+    // binary wrote. Detection has already run (in `Vault::create`); nothing has
+    // been moved. Block a normal writable session and let the user decide.
+    if vault.pending_quarantine().is_some() {
+        present_plaintext_conflict_dialog(vault, path, state, widgets, pending);
+        return;
+    }
+    finish_opening_vault(vault, path, state, widgets, pending);
+}
+
+/// The lock decision + commit, once any R18 plaintext conflict is resolved
+/// (quarantined, or the user chose to open read-only anyway).
+fn finish_opening_vault(
     vault: Vault,
     path: PathBuf,
     state: &Rc<RefCell<AppState>>,
@@ -2983,6 +3010,145 @@ fn present_lock_contention_dialog(
     });
 }
 
+/// R18: a Secure Vault opened with plaintext storage artifacts in its root
+/// (from an old / incompatible binary). Nothing has been moved. The user
+/// chooses: cancel, open read-only (artifacts untouched), or explicitly
+/// quarantine the plaintext into `.senatorial-notes/quarantine/<timestamp>/`
+/// and then open normally.
+fn present_plaintext_conflict_dialog(
+    vault: Vault,
+    path: PathBuf,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let name = { vault_display_name_for(&state.borrow().config, &path) };
+    let (file_count, categories): (usize, Vec<ArtifactCategory>) = vault
+        .pending_quarantine()
+        .map(|p| (p.file_count(), p.categories().to_vec()))
+        .unwrap_or((0, Vec::new()));
+    let found: Vec<&str> = categories.iter().map(|c| c.describe()).collect();
+
+    let detail = format!(
+        "\u{201c}{name}\u{201d} is a Secure Vault, but its folder also contains {file_count} \
+         plaintext file(s) that an older or incompatible version of SenatorialNotes wrote \
+         ({}). Your encrypted notes are safe and separate, and nothing has been changed.\n\n\
+         To open this Secure Vault normally, the plaintext files must first be moved, \
+         unchanged, into a quarantine folder inside the vault. Nothing is ever deleted, \
+         merged, or imported.",
+        found.join(", ")
+    );
+
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message(format!("Plaintext files found in \u{201c}{name}\u{201d}"))
+        .detail(detail)
+        .buttons(vec![
+            "Cancel",
+            "Open Read-Only",
+            "Quarantine Plaintext Files\u{2026}",
+        ])
+        .cancel_button(0)
+        .default_button(0)
+        .build();
+
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    let parent = widgets.window.clone();
+    dialog.choose(Some(&parent), None::<&gio::Cancellable>, move |result| {
+        let Ok(choice) = result else {
+            return;
+        };
+        match choice {
+            // Cancel: the switch is abandoned; the current vault is untouched.
+            0 => {}
+            // Open read-only: the plaintext artifacts are left exactly where
+            // they are; the vault opens with a non-owning lock and every write
+            // path is disabled.
+            1 => commit_vault_switch(
+                vault,
+                VaultLock::read_only(),
+                path,
+                &state,
+                &widgets,
+                &pending,
+            ),
+            // Quarantine, then open normally.
+            2 => match vault.quarantine_plaintext() {
+                Ok(report) => match Vault::open(&path) {
+                    Ok(clean) => {
+                        report_quarantine_success(&widgets, &report);
+                        finish_opening_vault(clean, path.clone(), &state, &widgets, &pending);
+                    }
+                    Err(error) => report_vault_open_error(
+                        &state,
+                        &widgets,
+                        &format!(
+                            "The plaintext files were quarantined to {}, but the Secure Vault \
+                             could not be reopened: {error}",
+                            report.quarantine_path.display()
+                        ),
+                    ),
+                },
+                Err(error) => present_quarantine_failure_dialog(
+                    vault, path, error, &state, &widgets, &pending,
+                ),
+            },
+            _ => {}
+        }
+    });
+}
+
+fn report_quarantine_success(widgets: &Widgets, report: &QuarantineReport) {
+    widgets.save_status.set_label(&format!(
+        "Moved {} plaintext file(s) to {}",
+        report.file_count,
+        report.quarantine_path.display()
+    ));
+}
+
+/// Quarantine could not complete. Every original file is preserved (some may
+/// already be inside the quarantine folder). The vault must not open writable.
+fn present_quarantine_failure_dialog(
+    vault: Vault,
+    path: PathBuf,
+    error: senatorial_notes::Error,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("The plaintext files could not be quarantined")
+        .detail(format!(
+            "{error}\n\nNothing was deleted and every original file is still in the vault \
+             folder (or already inside the quarantine folder). The Secure Vault was not \
+             opened for editing. You can open it read-only, or resolve the files yourself \
+             and try again."
+        ))
+        .buttons(vec!["Cancel", "Open Read-Only"])
+        .cancel_button(0)
+        .default_button(0)
+        .build();
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    let parent = widgets.window.clone();
+    dialog.choose(Some(&parent), None::<&gio::Cancellable>, move |result| {
+        if let Ok(1) = result {
+            commit_vault_switch(
+                vault,
+                VaultLock::read_only(),
+                path,
+                &state,
+                &widgets,
+                &pending,
+            );
+        }
+    });
+}
+
 /// The folder's own name, for the header switcher.
 /// The folder-derived fallback name for a vault at `path`.
 fn vault_display_name(path: &Path) -> &str {
@@ -3170,7 +3336,7 @@ fn render_vault_switcher(
     widgets: &Widgets,
     pending: &Rc<RefCell<PendingSaves>>,
 ) {
-    let (secure_vault_unlocked, vault_open) = {
+    let (secure_vault_unlocked, vault_open, session_read_only) = {
         let state = state.borrow();
         (
             state
@@ -3178,6 +3344,7 @@ fn render_vault_switcher(
                 .as_ref()
                 .is_some_and(|vault| vault.is_encrypted() && !vault.is_locked()),
             state.vault.is_some(),
+            state.read_only,
         )
     };
     widgets
@@ -3197,6 +3364,13 @@ fn render_vault_switcher(
         toggle("lock-vault", secure_vault_unlocked);
         toggle("change-vault-password", secure_vault_unlocked);
         toggle("rename-vault", vault_open);
+        // Plaintext export needs an unlocked Secure Vault and a writable
+        // session (never offered while read-only, e.g. an unresolved R18
+        // plaintext conflict).
+        toggle(
+            "export-standard-vault",
+            secure_vault_unlocked && !session_read_only,
+        );
     }
 
     let (current_root, current_name, read_only, warning, recents) = {
@@ -6714,6 +6888,352 @@ fn change_vault_password_flow(
     );
 }
 
+/// Secure \u{2192} Standard **safe export**. Only for an unlocked Secure Vault
+/// with a writable session. The user re-enters the Vault Password (used only to
+/// derive the worker's key material), picks an empty destination folder, and
+/// confirms that the copy will be unencrypted plaintext. The decrypt/build runs
+/// on a worker thread; the source Secure Vault is never modified.
+fn present_export_to_standard(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let source = {
+        let st = state.borrow();
+        let Some(vault) = st.vault.as_ref() else {
+            return;
+        };
+        if !vault.is_encrypted() || vault.is_locked() {
+            widgets
+                .save_status
+                .set_label("Unlock the Secure Vault before exporting it.");
+            return;
+        }
+        if st.read_only {
+            widgets
+                .save_status
+                .set_label("This Secure Vault is open read-only; it cannot be exported yet.");
+            return;
+        }
+        match vault.encrypted_keyfile() {
+            Ok(bytes) => ExportSource {
+                root: vault.root().to_path_buf(),
+                state_dir: vault.state_dir(),
+                vault_id: vault.vault_id(),
+                keyfile_bytes: bytes,
+            },
+            Err(error) => {
+                widgets
+                    .save_status
+                    .set_label(&format!("The Secure Vault could not be read: {error}"));
+                return;
+            }
+        }
+    };
+
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    let explainer = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Export to a Standard Vault")
+        .detail(
+            "This creates a new, separate Standard Vault containing unencrypted plaintext \
+             Markdown copies of every note in this Secure Vault, including trashed notes and \
+             the notebook structure. This Secure Vault is not changed.\n\n\
+             Individually encrypted (.snote) notes are copied exactly as they are and keep \
+             their own passwords. You will be asked for the Vault Password to continue.",
+        )
+        .buttons(vec!["Cancel", "Continue"])
+        .cancel_button(0)
+        .default_button(1)
+        .build();
+    let parent = widgets.window.clone();
+    explainer.choose(Some(&parent), None::<&gio::Cancellable>, move |result| {
+        if !matches!(result, Ok(1)) {
+            return;
+        }
+        export_step_password(source.clone(), &state, &widgets, &pending);
+    });
+}
+
+/// The `Send`-owned Secure Vault facts the export worker needs, carried through
+/// the dialog chain so no helper takes an unwieldy argument list.
+#[derive(Clone)]
+struct ExportSource {
+    root: PathBuf,
+    state_dir: PathBuf,
+    vault_id: Uuid,
+    keyfile_bytes: Vec<u8>,
+}
+
+fn export_step_password(
+    source: ExportSource,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    present_password_dialog(
+        &widgets.window.clone(),
+        "Confirm Vault Password",
+        "Re-enter this Secure Vault's password. It is used only to unlock the export and is \
+         not stored.",
+        false,
+        false,
+        "Continue",
+        move |maybe_password| {
+            let Some(password) = maybe_password else {
+                return;
+            };
+            export_step_choose_folder(source.clone(), password, &state, &widgets, &pending);
+        },
+    );
+}
+
+fn export_step_choose_folder(
+    source: ExportSource,
+    password: Zeroizing<String>,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Choose an Empty Folder for the Standard Vault")
+        .modal(true)
+        .build();
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    let parent = widgets.window.clone();
+    dialog.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
+        let destination = match result {
+            Ok(folder) => match folder.path() {
+                Some(path) => path,
+                None => {
+                    widgets
+                        .save_status
+                        .set_label("The selected folder is not a local path.");
+                    return;
+                }
+            },
+            Err(error) if !error.matches(gio::IOErrorEnum::Cancelled) => {
+                widgets
+                    .save_status
+                    .set_label(&format!("Folder selection failed: {error}"));
+                return;
+            }
+            Err(_) => return,
+        };
+        export_step_confirm(
+            source.clone(),
+            password.clone(),
+            destination,
+            &state,
+            &widgets,
+            &pending,
+        );
+    });
+}
+
+fn export_step_confirm(
+    source: ExportSource,
+    password: Zeroizing<String>,
+    destination: PathBuf,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Create an unencrypted copy?")
+        .detail(format!(
+            "The exported Standard Vault at {} will contain your notes as unencrypted \
+             plaintext on disk. Anyone with access to that folder can read them.",
+            destination.display()
+        ))
+        .buttons(vec!["Cancel", "Export"])
+        .cancel_button(0)
+        .default_button(0)
+        .build();
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    let parent = widgets.window.clone();
+    dialog.choose(Some(&parent), None::<&gio::Cancellable>, move |result| {
+        if !matches!(result, Ok(1)) {
+            return;
+        }
+        run_export_worker(
+            ExportParams {
+                source_root: source.root.clone(),
+                source_state_dir: source.state_dir.clone(),
+                vault_id: source.vault_id,
+                keyfile_bytes: source.keyfile_bytes.clone(),
+                password: password.clone(),
+                destination: destination.clone(),
+            },
+            &state,
+            &widgets,
+            &pending,
+        );
+    });
+}
+
+fn run_export_worker(
+    params: ExportParams,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let session = widgets.sessions.current();
+    let progress = ExportProgress::new();
+
+    // Modal progress window with a Cancel button.
+    let window = adw::Window::builder()
+        .transient_for(&widgets.window)
+        .modal(true)
+        .title("Exporting…")
+        .default_width(360)
+        .resizable(false)
+        .build();
+    let header = adw::HeaderBar::new();
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
+    let cancel = gtk::Button::with_label("Cancel");
+    header.pack_start(&cancel);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    let spinner = gtk::Spinner::new();
+    spinner.start();
+    let label = gtk::Label::new(Some("Preparing…"));
+    label.set_wrap(true);
+    label.set_xalign(0.0);
+    content.append(&spinner);
+    content.append(&label);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&content));
+    window.set_content(Some(&toolbar));
+    {
+        let progress = progress.clone();
+        let cancel_btn = cancel.clone();
+        cancel.connect_clicked(move |_| {
+            progress.request_cancel();
+            cancel_btn.set_sensitive(false);
+            cancel_btn.set_label("Cancelling…");
+        });
+    }
+    window.present();
+
+    // Poll progress into the label.
+    let poll = {
+        let progress = progress.clone();
+        let label = label.clone();
+        glib::timeout_add_local(Duration::from_millis(120), move || {
+            let total = progress.total();
+            if progress.is_cancelled() {
+                label.set_text("Cancelling…");
+            } else if total == 0 {
+                label.set_text("Preparing…");
+            } else {
+                label.set_text(&format!("Exporting notes… {} / {}", progress.done(), total));
+            }
+            glib::ControlFlow::Continue
+        })
+    };
+    let poll = Rc::new(RefCell::new(Some(poll)));
+
+    let worker = {
+        let progress = progress.clone();
+        gio::spawn_blocking(move || export_secure_vault_to_standard(params, progress))
+    };
+
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    glib::spawn_future_local(async move {
+        let outcome = worker.await;
+        if let Some(source) = poll.borrow_mut().take() {
+            source.remove();
+        }
+        window.close();
+        if !widgets.sessions.is_current(session) {
+            return;
+        }
+        match outcome {
+            Ok(Ok(report)) => {
+                present_export_success_dialog(report, &state, &widgets, &pending);
+            }
+            Ok(Err(senatorial_notes::Error::ExportCancelled)) => {
+                widgets
+                    .save_status
+                    .set_label("Export cancelled. Nothing was written.");
+            }
+            Ok(Err(error)) => {
+                let detail = format!("{error}");
+                let dialog = gtk::AlertDialog::builder()
+                    .modal(true)
+                    .message("The export did not finish")
+                    .detail(format!("{detail}\n\nThe Secure Vault was not changed."))
+                    .buttons(vec!["OK"])
+                    .build();
+                dialog.choose(
+                    Some(&widgets.window),
+                    None::<&gio::Cancellable>,
+                    move |_| {},
+                );
+            }
+            Err(_) => {
+                widgets
+                    .save_status
+                    .set_label("The export failed unexpectedly. The Secure Vault was not changed.");
+            }
+        }
+    });
+}
+
+fn present_export_success_dialog(
+    report: ExportReport,
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Widgets,
+    pending: &Rc<RefCell<PendingSaves>>,
+) {
+    let live = report.notes + report.snotes;
+    let detail = format!(
+        "Exported {live} note(s){} to {}. The Secure Vault is unchanged.",
+        if report.trashed > 0 {
+            format!(" and {} in Trash", report.trashed)
+        } else {
+            String::new()
+        },
+        report.destination.display()
+    );
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Export complete")
+        .detail(detail)
+        .buttons(vec!["Close", "Open Exported Vault"])
+        .cancel_button(0)
+        .default_button(0)
+        .build();
+    let state = state.clone();
+    let widgets = widgets.clone();
+    let pending = pending.clone();
+    let parent = widgets.window.clone();
+    let destination = report.destination.clone();
+    dialog.choose(Some(&parent), None::<&gio::Cancellable>, move |result| {
+        if let Ok(1) = result {
+            open_vault(&destination, false, &state, &widgets, &pending);
+        }
+    });
+}
+
 fn change_active_password(state: &Rc<RefCell<AppState>>, widgets: &Widgets) {
     if !persist_active(state, widgets, true) {
         return;
@@ -7660,6 +8180,20 @@ fn show_vault_settings(
             });
         }
         security.add(&change_password);
+
+        let export = adw::ActionRow::builder()
+            .title("Export to Standard Vault…")
+            .subtitle("Creates a new, unencrypted copy of every note in a folder you choose")
+            .activatable(true)
+            .build();
+        export.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        {
+            let window = window.clone();
+            export.connect_activated(move |_| {
+                let _ = window.activate_action("app.export-standard-vault", None);
+            });
+        }
+        security.add(&export);
         page.add(&security);
     }
 
@@ -8312,6 +8846,18 @@ fn install_actions(
         });
     }
     application.add_action(&rename_vault);
+
+    let export_standard_vault = gio::SimpleAction::new("export-standard-vault", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        let pending = pending.clone();
+        export_standard_vault.connect_activate(move |_, _| {
+            cancel_all_timers(&pending);
+            present_export_to_standard(&state, &widgets, &pending);
+        });
+    }
+    application.add_action(&export_standard_vault);
 
     let remove_encryption = gio::SimpleAction::new("remove-encryption", None);
     {

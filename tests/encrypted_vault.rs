@@ -902,3 +902,159 @@ fn creating_an_encrypted_vault_in_a_fresh_or_absent_folder_is_allowed() {
     fs::write(with_readme.join("README.txt"), "hello").unwrap();
     Vault::create_encrypted(&with_readme, PASSWORD).expect("an unrelated file is fine");
 }
+
+// ---------------------------------------------------------------------------
+// Stage E: corruption matrix — authentication uncertainty always fails closed,
+// no automatic reconstruction of unauthenticated data, corrupt evidence is
+// never deleted.
+// ---------------------------------------------------------------------------
+
+/// A vault with one saved note, plus the path of that note's blob.
+fn vault_with_one_note(root: &Path) -> (Vault, PathBuf, PathBuf) {
+    let vault = make_encrypted_vault(root);
+    let created = vault.create_note("Subject", "Inbox").unwrap();
+    let (mut note, stamp) = vault.load_note(&created.relative_path).unwrap();
+    note.body = "SECRET-BODY-DO-NOT-LEAK".into();
+    vault.save_note(&mut note, Some(&stamp)).unwrap();
+    let blob = blob_files(&vault)
+        .into_iter()
+        .map(|(p, _)| p)
+        .find(|p| p.file_name().and_then(|n| n.to_str()) != Some("manifest"))
+        .unwrap();
+    (vault, created.relative_path, blob)
+}
+
+#[test]
+fn a_truncated_note_blob_fails_closed() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("Vault");
+    let (vault, relative, blob) = vault_with_one_note(&root);
+    let bytes = fs::read(&blob).unwrap();
+    fs::write(&blob, &bytes[..bytes.len() - 10]).unwrap();
+
+    let err = vault.load_note(&relative).unwrap_err();
+    assert!(!format!("{err:?}").contains("SECRET-BODY"));
+    // The corrupt blob is still on disk — evidence is never destroyed.
+    assert!(blob.is_file());
+}
+
+#[test]
+fn a_corrupted_sealed_manifest_refuses_to_unlock() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("Vault");
+    {
+        let (vault, _, _) = vault_with_one_note(&root);
+        vault.lock();
+    }
+    let manifest = store_dir_path(&root).join("manifest");
+    let mut bytes = fs::read(&manifest).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xff;
+    fs::write(&manifest, &bytes).unwrap();
+
+    let vault = Vault::open(&root).expect("still opens locked");
+    assert!(
+        vault.unlock(PASSWORD).is_err(),
+        "a corrupt manifest must not unlock"
+    );
+    assert!(manifest.is_file());
+}
+
+#[test]
+fn a_truncated_sealed_manifest_refuses_to_unlock() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("Vault");
+    {
+        let (vault, _, _) = vault_with_one_note(&root);
+        vault.lock();
+    }
+    let manifest = store_dir_path(&root).join("manifest");
+    let bytes = fs::read(&manifest).unwrap();
+    fs::write(&manifest, &bytes[..bytes.len() / 2]).unwrap();
+
+    let vault = Vault::open(&root).expect("still opens locked");
+    assert!(vault.unlock(PASSWORD).is_err());
+}
+
+#[test]
+fn an_unknown_snenc_container_version_is_rejected() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("Vault");
+    let (vault, relative, blob) = vault_with_one_note(&root);
+    // SNENC header: magic[0..8], then container version at [8..10] big-endian.
+    let mut bytes = fs::read(&blob).unwrap();
+    bytes[8] = 0x00;
+    bytes[9] = 0x09;
+    fs::write(&blob, &bytes).unwrap();
+    assert!(vault.load_note(&relative).is_err());
+}
+
+#[test]
+fn an_unknown_object_type_is_rejected() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("Vault");
+    let (vault, relative, blob) = vault_with_one_note(&root);
+    // object_type is at header offset [44..46] big-endian.
+    let mut bytes = fs::read(&blob).unwrap();
+    bytes[44] = 0x00;
+    bytes[45] = 0x63; // 99: not a defined ObjectType
+    fs::write(&blob, &bytes).unwrap();
+    assert!(vault.load_note(&relative).is_err());
+}
+
+#[test]
+fn a_manifest_entry_whose_blob_is_missing_surfaces_and_loses_no_other_note() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("Vault");
+    let vault = make_encrypted_vault(&root);
+    let a = vault.create_note("Alpha", "Inbox").unwrap();
+    let b = vault.create_note("Beta", "Inbox").unwrap();
+
+    // Remove Alpha's blob (dangling manifest entry).
+    let a_blob = vault.note_path(&a.relative_path).unwrap();
+    fs::remove_file(&a_blob).unwrap();
+    vault.lock();
+    vault.unlock(PASSWORD).unwrap();
+
+    // Beta is fine; Alpha is reported as unreadable, never silently dropped.
+    assert!(vault.load_note(&b.relative_path).is_ok());
+    assert!(vault.load_note(&a.relative_path).is_err());
+    let listed = vault.scan_notes();
+    // scan either errors or lists both (one as a placeholder) — never silently 1.
+    if let Ok(summaries) = listed {
+        assert_eq!(
+            summaries.len(),
+            2,
+            "a dangling entry is not silently dropped"
+        );
+    }
+}
+
+#[test]
+fn a_wrong_current_vault_password_changes_nothing() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("Vault");
+    let vault = make_encrypted_vault(&root);
+    vault.create_note("keep", "Inbox").unwrap();
+    let keyfile_before = fs::read(root.join(".senatorial-notes/vault.keys")).unwrap();
+    let blobs_before = blob_files(&vault);
+
+    let err = vault
+        .change_vault_password("definitely not the password", "a fresh long passphrase")
+        .unwrap_err();
+    assert!(matches!(err, Error::DecryptionFailed));
+
+    assert_eq!(
+        keyfile_before,
+        fs::read(root.join(".senatorial-notes/vault.keys")).unwrap(),
+        "a failed password change must not rewrite the keyfile"
+    );
+    assert_eq!(blobs_before, blob_files(&vault));
+    // The real password still works.
+    vault.lock();
+    vault.unlock(PASSWORD).unwrap();
+}
+
+fn store_dir_path(root: &Path) -> PathBuf {
+    root.join(".senatorial-notes").join("store")
+}

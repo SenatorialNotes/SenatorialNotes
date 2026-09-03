@@ -89,6 +89,30 @@ pub enum Error {
          in an empty folder (converting an existing vault is not supported in this release)"
     )]
     EncryptedVaultTargetNotEmpty(PathBuf),
+
+    #[error("plaintext files in this Secure Vault could not be quarantined: {0}")]
+    Quarantine(String),
+
+    #[error(
+        "this Secure Vault contains {attachments} attachment(s) that this version of \
+         SenatorialNotes cannot represent in a Standard Vault; nothing was exported"
+    )]
+    ExportUnsupportedContent { attachments: usize },
+
+    #[error("the export destination is not usable: {0}")]
+    ExportTargetInvalid(String),
+
+    #[error("the export was cancelled; nothing was written to the destination")]
+    ExportCancelled,
+
+    #[error("the export could not be completed: {0}")]
+    ExportFailed(String),
+
+    #[error(
+        "the export failed and its temporary directory at {temp} could not be removed; \
+         it can be deleted manually (the destination was not created and the Secure Vault is unchanged)"
+    )]
+    ExportCleanupFailed { temp: PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
